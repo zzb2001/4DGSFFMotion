@@ -165,16 +165,24 @@ class Trainer:
 
     def train_step(self, batch):
         if self.viewer is not None:
-            while self.viewer.state.status == "paused":
+            # Support both old and new viewer APIs where `state` may be a string
+            # (e.g., "paused"/"rendering") or an object exposing `.status`.
+            def _get_status():
+                s = self.viewer.state
+                if isinstance(s, str):
+                    return s
+                return getattr(s, "status", None)
+
+            while _get_status() == "paused":
                 time.sleep(0.1)
             self.viewer.lock.acquire()
 
         loss, stats, num_rays_per_step, num_rays_per_sec = self.compute_losses(batch)
         if loss.isnan():
             guru.info(f"Loss is NaN at step {self.global_step}!!")
-            import ipdb
+            # import ipdb
 
-            ipdb.set_trace()
+            # ipdb.set_trace()
         loss.backward()
 
         for opt in self.optimizers.values():
@@ -189,7 +197,12 @@ class Trainer:
 
         if self.viewer is not None:
             self.viewer.lock.release()
-            self.viewer.state.num_train_rays_per_sec = num_rays_per_sec
+            # In some viewer versions, `state` is a string (e.g., "rendering"),
+            # not an object. Guard this assignment accordingly.
+            _state = getattr(self.viewer, "state", None)
+            if _state is not None and not isinstance(_state, str):
+                if hasattr(_state, "num_train_rays_per_sec"):
+                    _state.num_train_rays_per_sec = num_rays_per_sec
             if self.viewer.mode == "training":
                 self.viewer.update(self.global_step, num_rays_per_step)
 

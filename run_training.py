@@ -224,7 +224,7 @@ def init_model_from_tracks(
     vis: bool = False,
     port: int | None = None,
 ):
-    tracks_3d = TrackObservations(*train_dataset.get_tracks_3d(num_fg))
+    tracks_3d = TrackObservations(*train_dataset.get_tracks_3d(num_fg, step=10))
     print(
         f"{tracks_3d.xyz.shape=} {tracks_3d.visibles.shape=} "
         f"{tracks_3d.invisibles.shape=} {tracks_3d.confidences.shape} "
@@ -251,7 +251,8 @@ def init_model_from_tracks(
 
     bg_params = None
     if num_bg > 0:
-        bg_points = StaticObservations(*train_dataset.get_bkgd_points(num_bg))
+        # Subsample background points every 10 frames to reduce cost
+        bg_points = StaticObservations(*train_dataset.get_bkgd_points(num_bg, step=10))
         assert bg_points.check_sizes()
         bg_params = init_bg(bg_points)
         bg_params = bg_params.to(device)

@@ -233,9 +233,9 @@ def main(cfg: VideoConfig):
             wxyz=vt.SO3.from_matrix(avg_c2w[:3, :3]).wxyz,
             position=avg_c2w[:3, -1],
         )
-    import ipdb
+    # import ipdb
 
-    ipdb.set_trace()
+    # ipdb.set_trace()
 
     # num_frames = len(train_w2cs)
     # w2cs = train_w2cs[:1].repeat(num_frames, 1, 1)

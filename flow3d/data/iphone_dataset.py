@@ -428,8 +428,9 @@ class iPhoneDataset(BaseDataset):
             elif self.training:
                 # Compute the scene scale and transform for normalization.
                 # Normalize the scene based on the foreground 3D tracks.
+                # Subsample every 10 frames for normalization as requested
                 subsampled_tracks_3d = self.get_tracks_3d(
-                    num_samples=10000, step=self.num_frames // 10, show_pbar=False
+                    num_samples=10000, step=10, show_pbar=False
                 )[0]
                 scene_center = subsampled_tracks_3d.mean((0, 1))
                 tracks_3d_centered = subsampled_tracks_3d - scene_center
@@ -662,7 +663,7 @@ class iPhoneDataset(BaseDataset):
         )
 
     def get_bkgd_points(
-        self, num_samples: int, **kwargs
+        self, num_samples: int, step: int = 1, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         H, W = self.imgs.shape[1:3]
         grid = torch.stack(
@@ -673,7 +674,7 @@ class iPhoneDataset(BaseDataset):
             ),
             dim=-1,
         )
-        candidate_frames = list(range(self.num_frames))
+        candidate_frames = list(range(0, self.num_frames, step))
         num_sampled_frames = len(candidate_frames)
         bkgd_points, bkgd_point_normals, bkgd_point_colors = [], [], []
         for i in tqdm(candidate_frames, desc="Loading bkgd points", leave=False):

@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=3 python step2_train_4DGSFFMotion.py --config configs/ff4dgsmotion.yaml --output_dir results/FF4DGSMotion/train

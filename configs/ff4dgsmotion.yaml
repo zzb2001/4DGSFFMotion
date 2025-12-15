@@ -1,0 +1,165 @@
+# Trellis Minimal 4DGS config
+
+model:
+  # =========================
+  # FF4DGSMotion/models/FF4DGSMotion.py 参数（Step1~Step7）
+  # =========================
+
+  # Step 1: feat_reduce（2D → token 特征）
+  # Pi3 / DINO / backbone 输出通道（必须与 feat_2d 最后一维一致）
+  in_feat_dim: 2048
+  # 也兼容旧字段名：cond_channels / feat2d_in_dim
+  cond_channels: 2048
+  feat2d_in_dim: 2048
+
+  # 通用维度
+  feat_agg_dim: 256
+  feat_agg_layers: 1
+  feat_agg_heads: 4
+  time_emb_dim: 32
+  view_emb_dim: 32
+  motion_dim: 128
+
+  # Step 2: Dual Slot Prior（anchors 数量）
+  num_anchors_static: 4096
+  num_anchors_dynamic: 4096
+  slot_iters: 3
+
+  # Step A/B/C: coarse anchors + fine points（最终 M_full 不由 slot 决定）
+  coarse_stride: 8
+  fine_num_points: 150000
+  fine_sample_mode: topk_conf   # ["topk_conf","random"]
+  assign_topk: 8
+  assign_sigma: 0.05
+
+  # Step 5: Gaussian head
+  gaussian_head_hidden: 256
+  use_scale_refine: false
+  use_rot_refine: false
+  # 训练/渲染稳定性：限制网络预测的 world-space scale 上限
+  max_scale: 0.007
+
+
+  # Step 6（可选）：dyn_pred_token（学习动静）
+  use_dyn_pred_token: true
+
+  # Step 7（可选）：residual motion（细节点残差）
+  use_residual_motion: false
+
+  # Aggregator 视角 top-k（性能控制）
+  top_k_views: 4
+  # 当 fine_num_points 很大（例如 100k）时，避免 MHA/SDPA 触发 CUDA invalid configuration
+  point_agg_chunk: 25000
+training:
+  num_epochs: 150
+  num_frames: 4
+  sequence_length: 6
+  num_workers: 0
+  learning_rate: 1.0e-4
+  weight_decay: 0.0
+  freeze_backbone_epochs: 1      # warmup Sim(3) head only
+  # 多卡 DDP 本机端口（避免多人共用机器冲突时可改）
+  ddp_port: 29500
+  seed: 0
+  # 第 1 个 epoch 使用 target_image 做每个 Gaussian 的 DC 颜色初始化（参考 test_render.py / render_gs 的 est_color）
+  color_init_first_epoch: true
+  # 颜色初始化不作为监督 loss，而是用于渲染时的退火混合（帮助快速逼近合理颜色）
+  color_init_blend_start: 1.0    # 初始完全使用 init_sh0
+  color_init_blend_end: 0.0      # 最终完全使用网络输出
+  color_init_blend_steps: 2000   # 线性退火步数（按 global_step）
+  # fast_forward 的权重阈值（对齐 SimpleGaussianModel.fast_forward 的默认 0.05）
+  color_init_ff_weight_threshold: 0.1
+  debug_color_init: false
+  # 仅用于 epoch0 颜色初始化：每次 render_gs 后强制 CUDA synchronize（更稳、更好定位 illegal memory access；会变慢）
+  color_init_sync_cuda: true
+  # 仅用于 epoch0 的颜色初始化估计 pass（不写回网络输出），避免 est_weight≈0 导致 init_color≈灰
+  color_init_min_scale: 0.001
+  # init pass 专用：允许临时把 scale 拉大到该上限（不影响模型输出 max_scale）
+  color_init_max_scale: 0.05
+  # init pass 专用：提高最小透明度，避免 est_weight 太小
+  color_init_min_alpha: 0.8
+  # 仿照 test_gs_render.py 的流程：把初始化 pass 的 scale 调到像素半径范围，避免 radii/est_weight≈0
+  # 可选值：["min_clamp","pixel"]
+  color_init_scale_mode: pixel
+  color_init_r_target: 1.0
+  color_init_r_min: 0.5
+  color_init_r_max: 3.0
+
+  # 三阶段训练调度（按 epoch）
+  stages:
+    stage1_epochs: 50
+    stage2_epochs: 60
+    # 每阶段覆盖部分 loss 权重（未写的沿用 loss_weights）
+    stage1_weights:
+      chamfer: 0.01
+    stage2_weights:
+      motion_reg: 0.1
+      temporal_smooth: 0.1
+      mask_dyn: 0.0
+      mask_sta: 0.0
+      mask_cross: 0.0
+    stage3_weights:
+      motion_reg: 0.1
+      temporal_smooth: 0.1
+      mask_dyn: 0.0
+      mask_sta: 0.0
+      mask_cross: 0.0
+  # Stage3 residual loss（仅当 model.use_residual_motion=true 且输出 dxyz_t_res 时生效）
+  stage3_residual_mag: 0.5
+  stage3_residual_smooth: 0.1
+
+loss_weights:
+  photo_l1: 1.0
+  ssim: 0.5                      # SSIM term weight (on 1-SSIM)
+  silhouette: 1.0                # L1 between rendered alpha and seganymo mask
+  alpha_l1: 1.0e-4               # sparsity on per-Gaussian alpha
+  chamfer: 0.1                   # simple Chamfer between mu_t and GT points transformed by Sim(3)
+  dynamic_temporal: 0.0          # 2nd-order smoothness on mu_t
+  motion_reg: 0.0                # regularize per-frame motion using SegAnyMo dynamic_conf (set >0 to enable)
+
+loss_params:
+  ssim_window_size: 11           # odd number
+  ssim_ms_scales: 3              # multi-scale SSIM levels (>=1) for inference metrics
+  ssim_border: 0                 # pixels to crop on each border before SSIM (inference metrics)
+  silhouette_morph:
+    op: none                     # one of [none, dilate, erode]
+    k: 3                         # kernel size (odd)
+  chamfer:
+    weighted: true               # use weighted chamfer (training)
+    use_alpha: true              # weight by Gaussian alpha
+    use_visibility: true         # weight by per-point visibility aggregated from conf
+    max_pairs: 4096              # per-frame subsample cap for chamfer
+
+inference:
+  num_frames: 6
+  # Color init from multi-view images
+  color_init_blend: 1.0          # 0..1, 1.0 means fully use initialized color
+  color_init_win: 5              # window size for local averaging (odd)
+  color_init_sigma_scale: 1.5    # sigma multiplier from Gaussian scale
+  compute_chamfer: false
+  chamfer:
+    view_index: -1               # -1: use averaged; else 0..V-1 select one view's points
+    use_visibility: true
+    use_depth: false             # depth-based occlusion pruning
+    depth_tol: 0.01
+    use_alpha: true              # gate Gaussians by alpha
+    alpha_thresh: 0.1
+    conf_thresh: 0.5
+    max_pairs: 4096
+
+
+data:
+  pi3_results_dir: /home/star/zzb/Pi3/results/inference_1t_4views_beef_378_504
+  seganymo_dir: "/home/star/zzb/SegAnyMo/result/Ex4DGS"  # Path to SegAnyMo results
+  reloc3r_dir: "/home/star/zzb/reloc3r/results/beef_20views_sample4"  # Path to Reloc3r 
+  image_size: [378, 504]
+  # 预加载采样间隔：对应日志 "sampling every {sample_interval} steps"
+  sample_interval: 10
+  preload_all: true
+  use_sim3_normalize: false
+  ex4dgs_dir: /home/star/zzb/Pi3/assets/Ex4DGS
+  # Original camera intrinsics before resize (used to rescale intrinsics for rendering)
+  orig_size: [2028, 2704]   # [H0, W0]
+  f_orig: 1462.73832557
+  # Optional: override full K_orig if needed (3x3, row-major). If provided, f_orig/orig_size will be ignored.
+  K_orig: null

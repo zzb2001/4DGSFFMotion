@@ -73,37 +73,68 @@ def _soft_assign_topk(
     return idx_out, w_out
 
 
-def _sample_gumbel(shape, device, dtype, eps=1e-8):
-    u = torch.rand(shape, device=device, dtype=dtype)
-    return -torch.log(-torch.log(u.clamp(min=eps, max=1.0 - eps)))
-
-
-def _gumbel_topk_straight_through_sparse(logits: torch.Tensor, k: int, tau: float):
+def _thin_by_voxel_keep_max(
+    xyz: torch.Tensor,      # [N,3]
+    score: torch.Tensor,    # [N]
+    voxel_size: float,
+    eps_tie: float = 1e-6,
+) -> torch.Tensor:
     """
-    Sparse ST Gumbel-TopK:
-    - forward: hard top-k indices
-    - backward: gradients only through selected logits
+    Density-aware thinning without reconstruction:
+    - compute voxel index = floor(xyz / voxel_size)
+    - hash voxel index to 1D
+    - keep the point with max(score) per voxel (tie-broken by tiny noise)
 
-    Returns:
-        idx: [k] indices of selected items (hard)
-        y_st: [k] straight-through values corresponding to y[idx]
+    returns:
+        keep_idx: [M] indices into xyz (M <= N)
     """
-    N = logits.shape[0]
-    k = int(min(max(1, k), int(N)))
-    device, dtype = logits.device, logits.dtype
+    if xyz.numel() == 0:
+        return torch.zeros(0, device=xyz.device, dtype=torch.long)
+    if xyz.dim() != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
+    if score.dim() != 1 or score.shape[0] != xyz.shape[0]:
+        raise ValueError(f"score must be [N], got {tuple(score.shape)} vs N={xyz.shape[0]}")
 
-    # Gumbel noise
-    g = -torch.log(-torch.log(torch.rand_like(logits).clamp(1e-8, 1 - 1e-8)))
-    y = (logits + g) / float(max(1e-6, tau))
+    N = int(xyz.shape[0])
+    device = xyz.device
 
-    # hard selection
-    idx = torch.topk(y, k=k, largest=True).indices  # [k]
+    vs = float(max(1e-9, voxel_size))
+    # anchor to min to avoid huge indices
+    xyz_min = xyz.amin(dim=0, keepdim=True)
+    vidx = torch.floor((xyz - xyz_min) / vs).to(torch.int64)  # [N,3]
 
-    # straight-through trick (sparse)
-    y_hard = y[idx]
-    y_soft = y[idx]
-    y_st = y_hard.detach() + (y_soft - y_soft.detach())
-    return idx, y_st
+    # simple 3D hash to 1D
+    hx = vidx[:, 0] * 73856093
+    hy = vidx[:, 1] * 19349663
+    hz = vidx[:, 2] * 83492791
+    h = (hx ^ hy ^ hz)  # [N]
+
+    uniq_h, inv = torch.unique(h, return_inverse=True)
+    num_vox = int(uniq_h.shape[0])
+
+    # tie-break with tiny noise
+    score2 = score + eps_tie * torch.rand_like(score)
+
+    max_per_vox = torch.full((num_vox,), -1e30, device=device, dtype=score2.dtype)
+    max_per_vox.scatter_reduce_(0, inv, score2, reduce="amax", include_self=True)
+
+    keep_mask = score2 >= (max_per_vox[inv] - 1e-12)
+    keep_idx = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+
+    if keep_idx.numel() > num_vox:
+        h_keep = h[keep_idx]
+        order = torch.argsort(h_keep)
+        keep_idx = keep_idx[order]
+        h_keep = h_keep[order]
+        new_vox = torch.ones_like(h_keep, dtype=torch.bool)
+        new_vox[1:] = h_keep[1:] != h_keep[:-1]
+        keep_idx = keep_idx[new_vox]
+
+    return keep_idx
+
+
+
+
 
 
 class SlotAttention(nn.Module):
@@ -544,13 +575,9 @@ class ModelCfg:
     slot_iters: int = 3
 
     coarse_stride: int = 8
-    fine_num_points: int = 30000
-    fine_sample_mode: str = "topk_conf"  # ["topk_conf","random"]
     assign_topk: int = 8
     assign_sigma: float = 0.05
-    # ===== Differentiable importance selection (Stage C) =====
-    imp_candidate_points: int = 200000   # 候选集大小（从 TVHW 中抽取多少候选点再做可微选择）
-    imp_gumbel_tau: float = 1.0          # Gumbel-Softmax 温度（训练可退火到 0.2）
+    # ===== Soft-Existence importance selection (Stage C) =====
     imp_mlp_hidden: int = 256            # importance head hidden
     imp_use_xyz: bool = True             # 是否把 xyz 输入 importance head
     imp_use_conf: bool = True            # 是否把 conf 输入 importance head
@@ -558,7 +585,10 @@ class ModelCfg:
     imp_mix_uniform: float = 0.2         # proposal 分布：uniform 权重
     imp_mix_conf: float = 0.6            # proposal 分布：conf 权重
     imp_mix_dyn: float = 0.2             # proposal 分布：dyn 权重（若有）
-    imp_tau_min: float = 0.2             # 可选：训练后期最小 tau
+    imp_target_points: int = 100000      # Soft budget target M (existence mass)
+    # Thinning controls
+    imp_voxel_ratio: float = 2.0          # voxel_size multiplier
+    imp_min_voxel_size: float = 1e-4      # minimum voxel size to avoid zero
     # Safety cap for slot-attention tokens (coarse branch). Prevents OOM in [B,N,M] attention.
     max_coarse_tokens: int = 8000
 
@@ -828,10 +858,12 @@ class Trellis4DGS4DCanonical(nn.Module):
             dxyz_anchor_d = torch.zeros(T, 0, 3, device=device, dtype=dtype)
 
         # ============================================================
-        # Stage C (NEW): Differentiable importance field over points_full[T,V,H,W,3]
-        #   - build candidate set from all TVHW points (proposal)
-        #   - learn importance logits per candidate (differentiable)
-        #   - ST-Gumbel TopK selects M_full points (hard forward, soft gradients)
+        # Stage C (Soft-Existence):
+        #   C0: thinning (geometry de-redundancy; only discrete step)
+        #   C1: importance field per thinned point -> imp_logits
+        #   C2: soft existence exist_w = sigmoid(imp_logits)
+        #   C3: gate Gaussian alpha by exist_w
+        #   C4: gate motion by exist_w
         # ============================================================
 
         # ----- flatten TVHW for candidates -----
@@ -839,21 +871,6 @@ class Trellis4DGS4DCanonical(nn.Module):
         flat_xyz_all = torch.nan_to_num(points_full.reshape(-1, 3), nan=0.0, posinf=0.0, neginf=0.0)
         N_total = int(flat_xyz_all.shape[0])
 
-        M_full = int(min(max(0, int(self.cfg.fine_num_points)), N_total))
-        if M_full == 0:
-            return {
-                "mu_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
-                "scale_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
-                "rot_t": torch.zeros(T, 0, 3, 3, device=device, dtype=dtype),
-                "color_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
-                "alpha_t": torch.zeros(T, 0, 1, device=device, dtype=dtype),
-                "dxyz_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
-                "anchors_mu_static": mu_s0,
-                "anchors_mu_dynamic": mu_d0,
-                "dxyz_anchor_dynamic": dxyz_anchor_d,
-                "assign_idx_dynamic": torch.zeros(0, 0, device=device, dtype=torch.long),
-                "assign_w_dynamic": torch.zeros(0, 0, device=device, dtype=dtype),
-            }
 
         # ----- proposal distribution (non-topk): mixture of uniform + conf + dyn -----
         # conf_eff/dyn_eff are [T,V,H,W] or None
@@ -879,82 +896,97 @@ class Trellis4DGS4DCanonical(nn.Module):
         p = (p + 1e-8)
         p = p / p.sum().clamp(min=1e-8)
 
-        Ncand = int(min(max(1024, int(getattr(self.cfg, "imp_candidate_points", 200000))), N_total))
-        cand_idx = torch.multinomial(p, num_samples=Ncand, replacement=False)  # [Ncand] (proposal; ok to be non-diff)
+        # -------------------------
+        # Two-stage proposal:
+        #   1) pre-sample from p (bigger pool)
+        #   2) density-aware thinning (keep max-score per voxel)
+        #   3) multinomial again to final Ncand
+        # -------------------------
+        # ---------- Soft-Existence Stage C ----------
+        # C0: thinning is the only discrete step (geometry de-redundancy)
+        # Choose voxel size from full set bbox
+        xyz_min_all = flat_xyz_all.amin(dim=0)
+        xyz_max_all = flat_xyz_all.amax(dim=0)
+        scene_diag = torch.norm((xyz_max_all - xyz_min_all).clamp(min=1e-9)).item()
+        voxel_ratio = float(getattr(self.cfg, "imp_voxel_ratio", 2.0))
+        min_vs = float(getattr(self.cfg, "imp_min_voxel_size", 1e-4))
+        M_target = float(getattr(self.cfg, "imp_target_points", 100000))
+        voxel_size = max(min_vs, voxel_ratio * (scene_diag / (max(1.0, M_target) ** 0.5)))
 
-        xyz_cand = flat_xyz_all[cand_idx]  # [Ncand,3]
+        thin_idx = _thin_by_voxel_keep_max(flat_xyz_all, p, voxel_size=voxel_size)  # [N_thin]
+        xyz_0 = flat_xyz_all[thin_idx]  # [N_thin,3]
+        M = int(xyz_0.shape[0])
+        if M == 0:
+            return {
+                "mu_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
+                "scale_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
+                "rot_t": torch.zeros(T, 0, 3, 3, device=device, dtype=dtype),
+                "color_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
+                "alpha_t": torch.zeros(T, 0, 1, device=device, dtype=dtype),
+                "dxyz_t": torch.zeros(T, 0, 3, device=device, dtype=dtype),
+                "dxyz_t_res": None,
+                "anchors_mu_static": mu_s0,
+                "anchors_mu_dynamic": mu_d0,
+                "dxyz_anchor_dynamic": dxyz_anchor_d,
+                "assign_idx_dynamic": torch.zeros(0, 0, device=device, dtype=torch.long),
+                "assign_w_dynamic": torch.zeros(0, 0, device=device, dtype=dtype),
+                "exist_w": torch.zeros(0, 1, device=device, dtype=dtype),
+                "xyz_0": torch.zeros(0, 3, device=device, dtype=dtype),
+            }
 
-        # ----- gather candidate feat from feat_red (needs mapping flat idx -> t,v,y,x, then to H',W') -----
-        # feat_red: [T,V,Hp,Wp,C], points_full: [T,V,H,W,3]
-        # decode flat index in TVHW
+        # Decode index in TVHW to gather per-point features
         HW = int(H * W)
         VHW = int(V * HW)
-        t_idx = (cand_idx // VHW).clamp(0, T - 1)
-        rem0 = cand_idx - t_idx * VHW
+        t_idx = (thin_idx // VHW).clamp(0, T - 1)
+        rem0 = thin_idx - t_idx * VHW
         v_idx = (rem0 // HW).clamp(0, V - 1)
         rem1 = rem0 - v_idx * HW
         y_idx = (rem1 // W).clamp(0, H - 1)
         x_idx = (rem1 - y_idx * W).clamp(0, W - 1)
 
-        # map (y,x) in image to (yp,xp) in feat map (Hp,Wp)
         yp = ((y_idx.to(torch.long) * Hp) // max(1, H)).clamp(0, Hp - 1)
         xp = ((x_idx.to(torch.long) * Wp) // max(1, W)).clamp(0, Wp - 1)
 
-        feat_cand = feat_red[t_idx, v_idx, yp, xp, :]  # [Ncand,C]
+        feat_cand = feat_red[t_idx, v_idx, yp, xp, :]  # [M,C]
 
-        # ----- build importance head inputs -----
-        # time/view embedding (32 dims)
+        # C1: importance head inputs
         time_ids_long = time_ids.to(torch.long)
         t_emb = self.imp_time_emb(time_ids_long[t_idx].clamp(min=0, max=self.imp_time_emb.num_embeddings - 1))
         v_emb = self.imp_view_emb(v_idx.clamp(min=0, max=self.imp_view_emb.num_embeddings - 1))
-        pos_emb = torch.cat([t_emb, v_emb], dim=-1)  # [Ncand,32]
+        pos_emb = torch.cat([t_emb, v_emb], dim=-1)  # [M,32]
 
         inputs = [feat_cand, pos_emb]
         if bool(getattr(self.cfg, "imp_use_xyz", True)):
-            inputs.insert(1, xyz_cand)  # after feat
+            inputs.insert(1, xyz_0)
         if bool(getattr(self.cfg, "imp_use_conf", True)):
             if conf_flat is not None:
-                inputs.append(conf_flat[cand_idx].view(-1, 1))
+                inputs.append(conf_flat[thin_idx].view(-1, 1))
             else:
-                inputs.append(torch.zeros(Ncand, 1, device=device, dtype=dtype))
+                inputs.append(torch.zeros(M, 1, device=device, dtype=dtype))
         if bool(getattr(self.cfg, "imp_use_dyn", True)):
             if dyn_flat is not None:
-                inputs.append(dyn_flat[cand_idx].view(-1, 1))
+                inputs.append(dyn_flat[thin_idx].view(-1, 1))
             else:
-                inputs.append(torch.zeros(Ncand, 1, device=device, dtype=dtype))
+                inputs.append(torch.zeros(M, 1, device=device, dtype=dtype))
 
-        imp_in = torch.cat(inputs, dim=-1)  # [Ncand, D]
-        imp_logits = self.imp_head(imp_in).squeeze(-1)  # [Ncand]
+        imp_in = torch.cat(inputs, dim=-1)  # [M,D]
+        imp_logits = self.imp_head(imp_in).squeeze(-1)  # [M]
 
-        # ----- differentiable top-k selection (ST) -----
-        tau = float(kwargs.get("imp_gumbel_tau", getattr(self.cfg, "imp_gumbel_tau", 1.0)))
-        tau_min = float(getattr(self.cfg, "imp_tau_min", 0.2))
-        tau = max(tau_min, tau)  # you can anneal in training by editing cfg.imp_gumbel_tau each epoch
-
-        if self.training:
-            idx_hard, y_st = _gumbel_topk_straight_through_sparse(imp_logits, k=M_full, tau=tau)
-        else:
-            N = int(imp_logits.shape[0])
-            k = int(min(max(1, M_full), N))
-            y = imp_logits / float(max(1e-6, tau))
-            idx_hard = torch.topk(y, k=k, largest=True).indices
-            y_st = y[idx_hard]
-        # forward: hard index selection
-        xyz_f0 = xyz_cand[idx_hard]  # [M,3]
-
-        # ----- p_dyn_f: also selected sparsely -----
-        if dyn_flat is not None:
-            dyn_cand = dyn_flat[cand_idx].view(-1, 1)  # [Ncand,1]
-            p_dyn_f = dyn_cand[idx_hard].clamp(0.0, 1.0)  # [M,1]
-        else:
-            p_dyn_f = torch.full((M_full, 1), 0.5, device=device, dtype=dtype)
+        # C2: soft existence with budget normalization
+        exist_raw = torch.sigmoid(imp_logits)  # [M]
+        M_target = float(getattr(self.cfg, "imp_target_points", 100000))
+        eps = 1e-6
+        sum_exist = exist_raw.sum() + eps
+        scale = M_target / sum_exist
+        exist_w = torch.clamp(exist_raw * scale, 0.0, 1.0)  # [M]
+        exist_w1 = exist_w.view(-1, 1)
 
         # ============================================================
         # Stage C2/C3: soft assignment → distribute anchor motion to selected fine points
         # ============================================================
         if Md > 0:
             idx_d, w_d = _soft_assign_topk(
-                xyz_f0,
+                xyz_0,
                 mu_d0,
                 topk=int(self.cfg.assign_topk),
                 sigma=float(self.cfg.assign_sigma),
@@ -963,32 +995,37 @@ class Trellis4DGS4DCanonical(nn.Module):
             dxyz_sel = dxyz_anchor_d[:, idx_d]  # [T,M,K,3]
             dxyz_f = (w_d.unsqueeze(0).unsqueeze(-1) * dxyz_sel).sum(dim=2)  # [T,M,3]
         else:
-            idx_d = torch.zeros(M_full, 0, device=device, dtype=torch.long)
-            w_d = torch.zeros(M_full, 0, device=device, dtype=dtype)
-            dxyz_f = torch.zeros(T, M_full, 3, device=device, dtype=dtype)
+            idx_d = torch.zeros(M, 0, device=device, dtype=torch.long)
+            w_d = torch.zeros(M, 0, device=device, dtype=dtype)
+            dxyz_f = torch.zeros(T, M, 3, device=device, dtype=dtype)
 
-        # gate motion by dynamic probability
-        dxyz_f = dxyz_f * p_dyn_f.view(1, M_full, 1)
+        # gate motion by existence and dynamic probability
+        if dyn_flat is not None:
+            p_dyn_f = dyn_flat[thin_idx].view(-1, 1).clamp(0.0, 1.0)  # [M,1]
+        else:
+            p_dyn_f = torch.full((M, 1), 0.5, device=device, dtype=dtype)
+        gate_w = (exist_w1 * p_dyn_f).clamp(0.0, 1.0)
+        dxyz_f = dxyz_f * gate_w.view(1, M, 1)
 
         # Step 7: residual motion（可选）
         if self.residual_motion_head is not None:
             z_f = self.point_aggregator(
-                xyz_f0,
+                xyz_0,
                 feat_red[0:1],             # use t=0 features for residual input; ok
                 camera_poses[0:1],
                 camera_intrinsics[0:1],
                 time_ids[0:1],
             )  # [M,C]
             dxyz_res = self.residual_motion_head(z_f, time_ids)  # [T,M,3]
-            dxyz_f = dxyz_f + p_dyn_f.view(1, M_full, 1) * dxyz_res
+            dxyz_f = dxyz_f + gate_w.view(1, M, 1) * dxyz_res
         else:
             dxyz_res = None
 
-        mu_t = xyz_f0.unsqueeze(0) + dxyz_f  # [T,M,3]
+        mu_t = xyz_0.unsqueeze(0) + dxyz_f  # [T,M,3]
 
 
         # Step 4/5: 聚合外观特征 → 解码 Gaussian 属性（不改几何）
-        g = self.point_aggregator(xyz_f0, feat_red, camera_poses, camera_intrinsics, time_ids)  # [M,C]
+        g = self.point_aggregator(xyz_0, feat_red, camera_poses, camera_intrinsics, time_ids)  # [M,C]
         gauss = self.gaussian_head(g)
         # scale 有界化：避免直接 clamp(max) 导致触顶后梯度为 0（scale_t“学不动”）
         max_scale = float(getattr(self.cfg, "max_scale", 0.05))
@@ -998,7 +1035,8 @@ class Trellis4DGS4DCanonical(nn.Module):
         gauss["scale"] = (min_scale + (max_scale - min_scale) * s01).clamp(min=min_scale, max=max_scale)
 
         color_t = gauss["color"].unsqueeze(0).expand(T, -1, -1)
-        alpha_t = gauss["opacity"].unsqueeze(0).expand(T, -1, -1)
+        alpha_gate = (gauss["opacity"] * exist_w1).clamp(0.0, 1.0)  # gate alpha by existence
+        alpha_t = alpha_gate.unsqueeze(0).expand(T, -1, -1)
         scale_t = gauss["scale"].unsqueeze(0).expand(T, -1, -1)
         rot_t = gauss["rot"].unsqueeze(0).expand(T, -1, -1, -1)
 
@@ -1017,9 +1055,79 @@ class Trellis4DGS4DCanonical(nn.Module):
             "assign_w_dynamic": w_d,
             "p_dyn_f": p_dyn_f,
             # optional debug/regularization hooks
-            "xyz_f0": xyz_f0,
+            "xyz_0": xyz_0,
+            "exist_w": exist_w1,
             "imp_logits": imp_logits,
         }
+
+def _thin_by_voxel_keep_max(
+    xyz: torch.Tensor,      # [N,3]
+    score: torch.Tensor,    # [N] in [0,1] or any non-negative weights
+    voxel_size: float,
+    eps_tie: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Density-aware thinning without reconstruction:
+    - compute voxel index = floor(xyz / voxel_size)
+    - hash voxel index to 1D
+    - keep the point with max(score) per voxel (tie-broken by tiny noise)
+    returns:
+        keep_idx: [M] indices into xyz (M <= N)
+    """
+    if xyz.numel() == 0:
+        return torch.zeros(0, device=xyz.device, dtype=torch.long)
+    if xyz.dim() != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
+    if score.dim() != 1 or score.shape[0] != xyz.shape[0]:
+        raise ValueError(f"score must be [N], got {tuple(score.shape)} vs N={xyz.shape[0]}")
+
+    N = int(xyz.shape[0])
+    device = xyz.device
+
+    vs = float(max(1e-9, voxel_size))
+    # Use xyz_min to avoid huge indices if xyz is large
+    xyz_min = xyz.amin(dim=0, keepdim=True)
+    vidx = torch.floor((xyz - xyz_min) / vs).to(torch.int64)  # [N,3]
+
+    # hash 3D voxel index to 1D (using large primes, works for int64)
+    hx = vidx[:, 0] * 73856093
+    hy = vidx[:, 1] * 19349663
+    hz = vidx[:, 2] * 83492791
+    h = (hx ^ hy ^ hz)  # [N] int64
+
+    # map to compact voxel ids
+    uniq_h, inv = torch.unique(h, return_inverse=True)  # inv: [N] in [0,num_vox)
+    num_vox = int(uniq_h.shape[0])
+
+    # break ties deterministically-ish
+    # (important: if multiple points share same max score in a voxel, keep exactly one)
+    score2 = score + eps_tie * torch.rand_like(score)
+
+    # PyTorch>=2.0: scatter_reduce_ supports amax
+    max_per_vox = torch.full((num_vox,), -1e30, device=device, dtype=score2.dtype)
+    max_per_vox.scatter_reduce_(0, inv, score2, reduce="amax", include_self=True)
+
+    keep_mask = score2 >= (max_per_vox[inv] - 1e-12)
+    keep_idx = torch.nonzero(keep_mask, as_tuple=False).view(-1)  # may still have >1 in rare cases
+
+    # If still duplicates due to numerical issues, enforce one per voxel by sorting and unique.
+    if keep_idx.numel() > num_vox:
+        h_keep = h[keep_idx]
+        s_keep = score2[keep_idx]
+        # sort by (h, -s) to take best per voxel
+        order = torch.argsort(h_keep)  # group by h first
+        keep_idx = keep_idx[order]
+        h_keep = h_keep[order]
+        s_keep = s_keep[order]
+
+        # within each voxel group, keep first occurrence with maximal s (already close)
+        # do a stable pass: mark new voxel starts
+        new_vox = torch.ones_like(h_keep, dtype=torch.bool)
+        new_vox[1:] = h_keep[1:] != h_keep[:-1]
+        # keep first in each voxel group
+        keep_idx = keep_idx[new_vox]
+
+    return keep_idx
 
 
 if __name__ == "__main__":

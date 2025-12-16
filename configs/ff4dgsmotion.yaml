@@ -29,17 +29,19 @@ model:
   coarse_stride: 8
   # coarse slot tokens 上限（防止 SlotAttention 生成 [N,M] 巨大注意力矩阵导致 OOM）
   max_coarse_tokens: 8000
-  fine_num_points: 100000
-  fine_sample_mode: topk_conf   # ["topk_conf","random"]
   assign_topk: 8
   assign_sigma: 0.05
+  # Soft-Existence Stage C controls
+  imp_target_points: 100000      # soft budget target M
+  imp_voxel_ratio: 2.0           # stronger thinning by default
+  imp_min_voxel_size: 1.0e-4
 
   # Step 5: Gaussian head
   gaussian_head_hidden: 256
   use_scale_refine: false
   use_rot_refine: false
   # 训练/渲染稳定性：限制网络预测的 world-space scale 上限
-  max_scale: 0.007
+  max_scale: 0.01
   min_scale: 0.0001
 
 
@@ -113,6 +115,7 @@ loss_weights:
   imp_geom: 1.0                  # Importance–Geometry alignment (stage gating overrides)
   flow_reproj: 0.0               # Optical flow reprojection loss (enabled Stage>=2)
   imp_budget: 0.1                # Importance stabilizer (Stage1 small; overridden by stage gating)
+  exist_budget: 0.001            # Soft budget normalization loss weight (weak)
 
 loss_params:
   ssim_window_size: 11           # odd number

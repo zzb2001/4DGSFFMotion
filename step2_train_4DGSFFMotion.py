@@ -403,8 +403,11 @@ def train_epoch(
     sum_motion = 0.0
     sum_temporal = 0.0
     sum_imp_budget = 0.0
-    sum_imp_entropy = 0.0
-    sum_imp_repel = 0.0
+    sum_imp_geom = 0.0
+    sum_exist_budget = 0.0
+    sum_flow_reproj = 0.0
+    sum_res_mag = 0.0
+    sum_res_smooth = 0.0
     n_batches = 0
 
     last_rendered_images = None
@@ -892,13 +895,17 @@ def train_epoch(
             w_dyn = 0.0
             w_sta = 0.0
             w_cross = 0.0
-            # importance 正则（Stage1 强）：
-            w_imp_budget = 1.0
-            w_imp_entropy = 0.1
-            w_imp_repel = 0.01
+            # importance 稳定器（Stage1 仅小权重）
+            w_alpha=0
+            w_imp_budget = 0
+            w_imp_entropy = 0.0
+            w_imp_repel = 0.0
+            # 对齐损失强化
+            w_imp_geom = 0.0
+            w_flow_reproj = 0.0
         elif stage == 2:
-            # 开启：photo、motion、temporal；importance 仅保留很小预算；关闭 chamfer
-            w_imp_budget = 0.1
+            # 开启：photo、motion、temporal；importance 仅保留很小预算；Chm=0.05；alignment 继续保留但减弱
+            w_imp_budget = 0.05
             w_imp_entropy = 0.0
             w_imp_repel = 0.0
             w_motion = 1.0
@@ -1089,8 +1096,6 @@ def train_epoch(
 
         # ----- Stage C regularization (budget/entropy + repulsion) -----
         imp_budget_loss = torch.tensor(0.0, device=device)
-        imp_entropy_loss = torch.tensor(0.0, device=device)
-        imp_repel_loss = torch.tensor(0.0, device=device)
 
         imp_logits = output.get("imp_logits", None)
         if imp_logits is not None and (w_imp_budget > 0.0 or w_imp_entropy > 0.0):
@@ -1134,8 +1139,7 @@ def train_epoch(
             + w_res_mag * res_mag
             + w_res_smooth * res_smooth
             + w_imp_budget * imp_budget_loss
-            + w_imp_entropy * imp_entropy_loss
-            + w_imp_repel * imp_repel_loss
+
         )
         #【TODO】将rendered_images 和 gt_images [4, 4, 3, 378, 504]绘制在一张大图上，大图两行每行 16 张图
         # rendered_images_concat = torch.cat([rendered_images, gt_images], dim=0).view(32, 3, 378, 504)
@@ -1156,8 +1160,7 @@ def train_epoch(
         sum_motion += float(motion_reg.item())
         sum_temporal += float(temporal_smooth.item())
         sum_imp_budget += float(imp_budget_loss.item())
-        sum_imp_entropy += float(imp_entropy_loss.item())
-        sum_imp_repel += float(imp_repel_loss.item())
+
         n_batches += 1
 
         # Save last batch artifacts (after streaming, rendered_images 不再存在)
@@ -1184,8 +1187,7 @@ def train_epoch(
             writer.add_scalar('Loss/MotionReg', sum_motion / denom, global_step)
             writer.add_scalar('Loss/TemporalSmooth', sum_temporal / denom, global_step)
             writer.add_scalar("Loss/ImpBudget", sum_imp_budget / denom, global_step)
-            writer.add_scalar("Loss/ImpEntropy", sum_imp_entropy / denom, global_step)
-            writer.add_scalar("Loss/ImpRepel", sum_imp_repel / denom, global_step)
+
             if do_color_init:
                 # 记录当前退火系数（越大越依赖 init_sh0）
                 if blend_steps > 0:
@@ -1307,8 +1309,7 @@ def train_epoch(
         'motion_reg': sum_motion / denom,
         'temporal_smooth': sum_temporal / denom,
         "imp_budget_loss": sum_imp_budget / denom,
-        "imp_entropy_loss": sum_imp_entropy / denom,
-        "imp_repel_loss": sum_imp_repel / denom,
+
     }
 
 
@@ -1799,7 +1800,21 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
 
         # Only rank0 runs validation + saves checkpoints
         if is_rank0:
-            print(f"Train Loss: {train_metrics['loss']:.4f} | Photo: {train_metrics['photo_loss']:.4f} | SSIM: {train_metrics['ssim_loss']:.4f}")
+            # pretty print non-zero train metrics
+            def _fmt_metrics(title: str, m: dict, keys: list[str], tol: float = 1e-8) -> str:
+                parts = [f"{title}: {m.get('loss', 0.0):.4f}"]
+                for k in keys:
+                    v = float(m.get(k, 0.0))
+                    if abs(v) > tol:
+                        pretty = k.replace('_', ' ').title()
+                        parts.append(f"{pretty}: {v:.4f}")
+                return " | ".join(parts)
+            train_keys = [
+                'photo_loss','ssim_loss','alpha_sparsity','chamfer_loss','motion_reg',
+                'temporal_smooth','imp_budget_loss','imp_geom_loss','exist_budget_loss',
+                'flow_reproj_loss','residual_mag','residual_smooth'
+            ]
+            print(_fmt_metrics("Train", train_metrics, train_keys))
 
             if val_loader is not None:
                 val_metrics = validate(
@@ -1808,7 +1823,11 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
                     photo_loss_fn, device, config, writer, ep,
                     ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
                 )
-                print(f"Val   Loss: {val_metrics['loss']:.4f} | Photo: {val_metrics['photo_loss']:.4f} | SSIM: {val_metrics['ssim_loss']:.4f} | Alpha: {val_metrics['alpha_sparsity']:.4f} | Silhouette: {val_metrics['silhouette_loss']:.4f} | Chamfer: {val_metrics['chamfer_loss']:.4f} | MotionReg: {val_metrics['motion_reg']:.4f} | TemporalSmooth: {val_metrics['temporal_smooth']:.4f}")
+                val_keys = [
+                    'photo_loss','ssim_loss','alpha_sparsity','silhouette_loss','chamfer_loss',
+                    'motion_reg','temporal_smooth'
+                ]
+                print(_fmt_metrics("Val", val_metrics, val_keys))
             else:
                 val_metrics = {'loss': float('inf')}
 

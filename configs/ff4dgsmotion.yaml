@@ -27,7 +27,9 @@ model:
 
   # Step A/B/C: coarse anchors + fine points（最终 M_full 不由 slot 决定）
   coarse_stride: 8
-  fine_num_points: 150000
+  # coarse slot tokens 上限（防止 SlotAttention 生成 [N,M] 巨大注意力矩阵导致 OOM）
+  max_coarse_tokens: 8000
+  fine_num_points: 100000
   fine_sample_mode: topk_conf   # ["topk_conf","random"]
   assign_topk: 8
   assign_sigma: 0.05
@@ -38,21 +40,22 @@ model:
   use_rot_refine: false
   # 训练/渲染稳定性：限制网络预测的 world-space scale 上限
   max_scale: 0.007
+  min_scale: 0.0001
 
 
   # Step 6（可选）：dyn_pred_token（学习动静）
   use_dyn_pred_token: true
 
   # Step 7（可选）：residual motion（细节点残差）
-  use_residual_motion: false
+  use_residual_motion: true
 
   # Aggregator 视角 top-k（性能控制）
   top_k_views: 4
   # 当 fine_num_points 很大（例如 100k）时，避免 MHA/SDPA 触发 CUDA invalid configuration
   point_agg_chunk: 25000
 training:
-  num_epochs: 150
-  num_frames: 4
+  num_epochs: 300
+  num_frames: 6
   sequence_length: 6
   num_workers: 0
   learning_rate: 1.0e-4
@@ -69,6 +72,9 @@ training:
   color_init_blend_steps: 2000   # 线性退火步数（按 global_step）
   # fast_forward 的权重阈值（对齐 SimpleGaussianModel.fast_forward 的默认 0.05）
   color_init_ff_weight_threshold: 0.1
+  # init pass 安全上限：target_image 路径下 N 太大可能触发 rasterizer illegal memory access
+  color_init_max_gaussians: 120000
+  # 颜色初始化最多使用的视角数（越大越稳但越慢；同时可能更容易触发 rasterizer 问题）
   debug_color_init: false
   # 仅用于 epoch0 颜色初始化：每次 render_gs 后强制 CUDA synchronize（更稳、更好定位 illegal memory access；会变慢）
   color_init_sync_cuda: true
@@ -88,34 +94,25 @@ training:
   # 三阶段训练调度（按 epoch）
   stages:
     stage1_epochs: 50
-    stage2_epochs: 60
-    # 每阶段覆盖部分 loss 权重（未写的沿用 loss_weights）
-    stage1_weights:
-      chamfer: 0.01
-    stage2_weights:
-      motion_reg: 0.1
-      temporal_smooth: 0.1
-      mask_dyn: 0.0
-      mask_sta: 0.0
-      mask_cross: 0.0
-    stage3_weights:
-      motion_reg: 0.1
-      temporal_smooth: 0.1
-      mask_dyn: 0.0
-      mask_sta: 0.0
-      mask_cross: 0.0
+    stage2_epochs: 100
   # Stage3 residual loss（仅当 model.use_residual_motion=true 且输出 dxyz_t_res 时生效）
   stage3_residual_mag: 0.5
   stage3_residual_smooth: 0.1
+  # 训练可视化（epoch_images）：只保存一个小子集，避免占用大量内存/磁盘
+  viz:
+    times: 4
+    views: 4
 
 loss_weights:
   photo_l1: 1.0
   ssim: 0.5                      # SSIM term weight (on 1-SSIM)
-  silhouette: 1.0                # L1 between rendered alpha and seganymo mask
   alpha_l1: 1.0e-4               # sparsity on per-Gaussian alpha
-  chamfer: 0.1                   # simple Chamfer between mu_t and GT points transformed by Sim(3)
+  chamfer: 0.0                   # Chamfer weight base (stage gating overrides)
   dynamic_temporal: 0.0          # 2nd-order smoothness on mu_t
-  motion_reg: 0.0                # regularize per-frame motion using SegAnyMo dynamic_conf (set >0 to enable)
+  motion_reg: 0.0                # regularize per-frame motion using SegAnyMo dynamic_conf (stage gating overrides)
+  imp_geom: 1.0                  # Importance–Geometry alignment (stage gating overrides)
+  flow_reproj: 0.0               # Optical flow reprojection loss (enabled Stage>=2)
+  imp_budget: 0.1                # Importance stabilizer (Stage1 small; overridden by stage gating)
 
 loss_params:
   ssim_window_size: 11           # odd number
@@ -128,7 +125,7 @@ loss_params:
     weighted: true               # use weighted chamfer (training)
     use_alpha: true              # weight by Gaussian alpha
     use_visibility: true         # weight by per-point visibility aggregated from conf
-    max_pairs: 4096              # per-frame subsample cap for chamfer
+    max_pairs: 2048              # per-frame subsample cap for chamfer (lower to reduce cost; Stage 3 only)
 
 inference:
   num_frames: 6
@@ -154,7 +151,7 @@ data:
   reloc3r_dir: "/home/star/zzb/reloc3r/results/beef_20views_sample4"  # Path to Reloc3r 
   image_size: [378, 504]
   # 预加载采样间隔：对应日志 "sampling every {sample_interval} steps"
-  sample_interval: 10
+  sample_interval: 30
   preload_all: true
   use_sim3_normalize: false
   ex4dgs_dir: /home/star/zzb/Pi3/assets/Ex4DGS

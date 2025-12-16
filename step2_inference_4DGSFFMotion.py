@@ -831,7 +831,7 @@ def _load_hf_backbone(model: Trellis4DGS4DCanonical, hf_dir: str, device: torch.
 def main():
     parser = argparse.ArgumentParser(description='Inference Baseline 4DGS')
     parser.add_argument('--config', type=str, default='configs/anchorwarp_4dgs.yaml', help='Path to config file')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint file (optional)')
+    parser.add_argument('--resume', type=str, default=None, help='Path to training checkpoint (.pth). If omitted, use randomly initialized model')
     parser.add_argument('--hf_dir', type=str, default='weights/TRELLIS-image-large', help='Directory containing HuggingFace weights (ckpts)')
     parser.add_argument('--output_dir', type=str, default='results_train/AnchorWarp4DGS/inference', help='Output directory for results')
     parser.add_argument('--batch_size', type=int, default=None, help='Batch size (should equal T, overrides inference.num_frames)')
@@ -919,14 +919,29 @@ def main():
     model = Trellis4DGS4DCanonical(cfg=model_config).to(device)
     print("Using Trellis4DGS4DCanonical (FF4DGSMotion.py Step1~Step7)")
 
-    if args.checkpoint:
-        print(f"Loading checkpoint from {args.checkpoint}...")
-        checkpoint = torch.load(args.checkpoint, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+    # Load checkpoint from --resume (training ckpt)
+    ckpt_path = args.resume
+    if ckpt_path:
+        if not os.path.isabs(ckpt_path):
+            ckpt_path = os.path.abspath(ckpt_path)
+        if os.path.exists(ckpt_path):
+            print(f"Loading checkpoint from {ckpt_path}...")
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            # Support both training checkpoints and raw state_dict
+            state = checkpoint.get('model_state_dict', None) if isinstance(checkpoint, dict) else None
+            if state is None and isinstance(checkpoint, dict):
+                # Some checkpoints use 'state_dict'
+                state = checkpoint.get('state_dict', None)
+            try:
+                if state is not None:
+                    model.load_state_dict(state)
+                else:
+                    model.load_state_dict(checkpoint)
+                print("Model loaded successfully!")
+            except Exception as e:
+                print(f"Failed to load checkpoint: {e}")
         else:
-            model.load_state_dict(checkpoint)
-        print("Model loaded successfully!")
+            print(f"Checkpoint not found: {ckpt_path}. Using randomly initialized model.")
     else:
         print("No checkpoint provided; using randomly initialized model.")
 

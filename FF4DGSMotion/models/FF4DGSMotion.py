@@ -73,6 +73,99 @@ def _soft_assign_topk(
     return idx_out, w_out
 
 
+def _thin_by_voxel_keep_max(
+    xyz: torch.Tensor,      # [N,3]
+    score: torch.Tensor,    # [N]
+    voxel_size: float,
+    eps_tie: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Density-aware thinning without reconstruction:
+    - compute voxel index = floor(xyz / voxel_size)
+    - hash voxel index to 1D
+    - keep the point with max(score) per voxel (tie-broken by tiny noise)
+
+    returns:
+        keep_idx: [M] indices into xyz (M <= N)
+    """
+    if xyz.numel() == 0:
+        return torch.zeros(0, device=xyz.device, dtype=torch.long)
+    if xyz.dim() != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
+    if score.dim() != 1 or score.shape[0] != xyz.shape[0]:
+        raise ValueError(f"score must be [N], got {tuple(score.shape)} vs N={xyz.shape[0]}")
+
+    N = int(xyz.shape[0])
+    device = xyz.device
+
+    vs = float(max(1e-9, voxel_size))
+    # anchor to min to avoid huge indices
+    xyz_min = xyz.amin(dim=0, keepdim=True)
+    vidx = torch.floor((xyz - xyz_min) / vs).to(torch.int64)  # [N,3]
+
+    # simple 3D hash to 1D
+    hx = vidx[:, 0] * 73856093
+    hy = vidx[:, 1] * 19349663
+    hz = vidx[:, 2] * 83492791
+    h = (hx ^ hy ^ hz)  # [N]
+
+    uniq_h, inv = torch.unique(h, return_inverse=True)
+    num_vox = int(uniq_h.shape[0])
+
+    # tie-break with tiny noise
+    score2 = score + eps_tie * torch.rand_like(score)
+
+    max_per_vox = torch.full((num_vox,), -1e30, device=device, dtype=score2.dtype)
+    max_per_vox.scatter_reduce_(0, inv, score2, reduce="amax", include_self=True)
+
+    keep_mask = score2 >= (max_per_vox[inv] - 1e-12)
+    keep_idx = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+
+    if keep_idx.numel() > num_vox:
+        h_keep = h[keep_idx]
+        order = torch.argsort(h_keep)
+        keep_idx = keep_idx[order]
+        h_keep = h_keep[order]
+        new_vox = torch.ones_like(h_keep, dtype=torch.bool)
+        new_vox[1:] = h_keep[1:] != h_keep[:-1]
+        keep_idx = keep_idx[new_vox]
+
+    return keep_idx
+
+
+def _sample_gumbel(shape, device, dtype, eps=1e-8):
+    u = torch.rand(shape, device=device, dtype=dtype)
+    return -torch.log(-torch.log(u.clamp(min=eps, max=1.0 - eps)))
+
+
+def _gumbel_topk_straight_through_sparse(logits: torch.Tensor, k: int, tau: float):
+    """
+    Sparse ST Gumbel-TopK:
+    - forward: hard top-k indices
+    - backward: gradients only through selected logits
+
+    Returns:
+        idx: [k] indices of selected items (hard)
+        y_st: [k] straight-through values corresponding to y[idx]
+    """
+    N = logits.shape[0]
+    k = int(min(max(1, k), int(N)))
+    device, dtype = logits.device, logits.dtype
+
+    # Gumbel noise
+    g = -torch.log(-torch.log(torch.rand_like(logits).clamp(1e-8, 1 - 1e-8)))
+    y = (logits + g) / float(max(1e-6, tau))
+
+    # hard selection
+    idx = torch.topk(y, k=k, largest=True).indices  # [k]
+
+    # straight-through trick (sparse)
+    y_hard = y[idx]
+    y_soft = y[idx]
+    y_st = y_hard.detach() + (y_soft - y_soft.detach())
+    return idx, y_st
+
+
 class SlotAttention(nn.Module):
     def __init__(self, num_slots: int, dim: int, iters: int = 3, eps: float = 1e-8, hidden_dim: int = 256):
         super().__init__()
@@ -515,6 +608,24 @@ class ModelCfg:
     fine_sample_mode: str = "topk_conf"  # ["topk_conf","random"]
     assign_topk: int = 8
     assign_sigma: float = 0.05
+    # ===== Differentiable importance selection (Stage C) =====
+    imp_candidate_points: int = 200000   # 候选集大小（从 TVHW 中抽取多少候选点再做可微选择）
+    imp_gumbel_tau: float = 1.0          # Gumbel-Softmax 温度（训练可退火到 0.2）
+    imp_mlp_hidden: int = 256            # importance head hidden
+    imp_use_xyz: bool = True             # 是否把 xyz 输入 importance head
+    imp_use_conf: bool = True            # 是否把 conf 输入 importance head
+    imp_use_dyn: bool = True             # 是否把 dyn 输入 importance head（若有）
+    imp_mix_uniform: float = 0.2         # proposal 分布：uniform 权重
+    imp_mix_conf: float = 0.6            # proposal 分布：conf 权重
+    imp_mix_dyn: float = 0.2             # proposal 分布：dyn 权重（若有）
+    imp_tau_min: float = 0.2             # 可选：训练后期最小 tau
+    # Proposal / thinning (two-stage proposal)
+    imp_pre_sample_factor: float = 3.0    # N_pre = factor * Ncand
+    imp_thin_keep_factor: float = 2.0     # N_thin target = keep_factor * Ncand
+    imp_voxel_ratio: float = 1.0          # voxel_size multiplier
+    imp_min_voxel_size: float = 1e-4      # minimum voxel size to avoid zero
+    # Safety cap for slot-attention tokens (coarse branch). Prevents OOM in [B,N,M] attention.
+    max_coarse_tokens: int = 8000
 
     use_dyn_pred_token: bool = True
     use_residual_motion: bool = False
@@ -522,6 +633,7 @@ class ModelCfg:
     top_k_views: int = 4
     point_agg_chunk: int = 20000
     max_scale: float = 0.05
+    min_scale: float = 1e-4
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "ModelCfg":
@@ -609,6 +721,27 @@ class Trellis4DGS4DCanonical(nn.Module):
             )
         else:
             self.residual_motion_head = None
+
+        # ===== Stage C: differentiable importance field (learnable point selector) =====
+        imp_in = int(self.cfg.feat_agg_dim)
+        if bool(self.cfg.imp_use_xyz):
+            imp_in += 3
+        if bool(self.cfg.imp_use_conf):
+            imp_in += 1
+        if bool(self.cfg.imp_use_dyn):
+            imp_in += 1
+
+        # time/view embedding（轻量）
+        self.imp_time_emb = nn.Embedding(512, 16)
+        self.imp_view_emb = nn.Embedding(64, 16)
+
+        self.imp_head = nn.Sequential(
+            nn.Linear(imp_in + 32, int(self.cfg.imp_mlp_hidden)),
+            nn.SiLU(),
+            nn.Linear(int(self.cfg.imp_mlp_hidden), int(self.cfg.imp_mlp_hidden)),
+            nn.SiLU(),
+            nn.Linear(int(self.cfg.imp_mlp_hidden), 1),
+        )
 
     def reset_world_cache(self):
         self._world_aabb = None
@@ -725,6 +858,21 @@ class Trellis4DGS4DCanonical(nn.Module):
         else:
             token_p_dyn = torch.full((1, Nc, 1), 0.5, device=device, dtype=dtype)
 
+        # --- OOM guard: subsample coarse tokens before slot attention ---
+        max_tokens = int(getattr(self.cfg, "max_coarse_tokens", 0))
+        if max_tokens > 0 and Nc > max_tokens:
+            # Prefer sampling visible tokens; fall back to uniform.
+            p = token_p_vis.view(-1)
+            if not torch.isfinite(p).all() or float(p.sum().item()) <= 0:
+                p = torch.ones_like(p)
+            p = (p + 1e-8) / (p.sum().clamp_min(1e-8))
+            idx = torch.multinomial(p, num_samples=max_tokens, replacement=False)
+            token_xyz = token_xyz[:, idx]
+            token_feat = token_feat[:, idx]
+            token_p_vis = token_p_vis[:, idx]
+            token_p_dyn = token_p_dyn[:, idx]
+            Nc = int(max_tokens)
+
         # Step 2: Dual Slot Prior（canonical anchors）
         anchors = self.dual_slot_prior(
             token_feat=token_feat,
@@ -744,10 +892,18 @@ class Trellis4DGS4DCanonical(nn.Module):
         else:
             dxyz_anchor_d = torch.zeros(T, 0, 3, device=device, dtype=dtype)
 
-        # Stage C1: fine 点采样（最终 M_full）
-        points_t0 = points_full[0]  # [V,H,W,3]
-        flat_xyz0 = torch.nan_to_num(points_t0.reshape(-1, 3), nan=0.0, posinf=0.0, neginf=0.0)
-        N_total = int(flat_xyz0.shape[0])
+        # ============================================================
+        # Stage C (NEW): Differentiable importance field over points_full[T,V,H,W,3]
+        #   - build candidate set from all TVHW points (proposal)
+        #   - learn importance logits per candidate (differentiable)
+        #   - ST-Gumbel TopK selects M_full points (hard forward, soft gradients)
+        # ============================================================
+
+        # ----- flatten TVHW for candidates -----
+        # points_full: [T,V,H,W,3]
+        flat_xyz_all = torch.nan_to_num(points_full.reshape(-1, 3), nan=0.0, posinf=0.0, neginf=0.0)
+        N_total = int(flat_xyz_all.shape[0])
+
         M_full = int(min(max(0, int(self.cfg.fine_num_points)), N_total))
         if M_full == 0:
             return {
@@ -764,42 +920,150 @@ class Trellis4DGS4DCanonical(nn.Module):
                 "assign_w_dynamic": torch.zeros(0, 0, device=device, dtype=dtype),
             }
 
-        conf_flat0 = None
+        # ----- proposal distribution (non-topk): mixture of uniform + conf + dyn -----
+        # conf_eff/dyn_eff are [T,V,H,W] or None
+        conf_flat = None
         if conf_eff is not None:
-            conf0 = conf_eff[0].to(device=device, dtype=dtype)  # [V,H,W]
-            conf_flat0 = conf0.reshape(-1).clamp(0.0, 1.0)
+            conf_flat = conf_eff.to(device=device, dtype=dtype).reshape(-1).clamp(0.0, 1.0)
 
-        mode = str(self.cfg.fine_sample_mode).lower()
-        if mode == "topk_conf" and conf_flat0 is not None:
-            _, fine_idx = torch.topk(conf_flat0, k=M_full, largest=True)
-        else:
-            if conf_flat0 is not None:
-                p = (conf_flat0 + 1e-8)
-                p = p / p.sum().clamp(min=1e-8)
-                fine_idx = torch.multinomial(p, num_samples=M_full, replacement=False)
-            else:
-                fine_idx = torch.randperm(N_total, device=device)[:M_full]
-
-        xyz_f0 = flat_xyz0[fine_idx]  # [M,3]
-
-        # p_dyn_f：优先 dyn_mask；否则从 coarse token_p_dyn 近似（按 (v,y,x) 映射）
+        dyn_flat = None
         if dyn_eff is not None:
-            dyn0 = dyn_eff[0].to(device=device, dtype=dtype)  # [V,H,W]
-            dyn_flat0 = dyn0.reshape(-1)
-            p_dyn_f = dyn_flat0[fine_idx].clamp(0.0, 1.0).view(M_full, 1)
-        else:
-            # decode (v,y,x) from fine_idx
-            HW = int(H * W)
-            v_idx = (fine_idx // HW).clamp(0, V - 1)
-            rem = fine_idx - v_idx * HW
-            y_idx = (rem // W).clamp(0, H - 1)
-            x_idx = (rem - y_idx * W).clamp(0, W - 1)
-            yc = ((y_idx.to(torch.long) * Hc) // max(1, H)).clamp(0, Hc - 1)
-            xc = ((x_idx.to(torch.long) * Wc) // max(1, W)).clamp(0, Wc - 1)
-            p_dyn_map = token_p_dyn.view(T, V, Hc, Wc, 1)[0]  # [V,Hc,Wc,1]
-            p_dyn_f = p_dyn_map[v_idx, yc, xc, :].contiguous().view(M_full, 1).clamp(0.0, 1.0)
+            dyn_flat = dyn_eff.to(device=device, dtype=dtype).reshape(-1).clamp(0.0, 1.0)
 
-        # Stage C2/C3: soft assignment → 分发 anchor motion 到 fine 点
+        w_uni = float(getattr(self.cfg, "imp_mix_uniform", 0.2))
+        w_conf = float(getattr(self.cfg, "imp_mix_conf", 0.6))
+        w_dyn = float(getattr(self.cfg, "imp_mix_dyn", 0.2))
+
+        p = torch.ones(N_total, device=device, dtype=dtype) * max(0.0, w_uni)
+        if conf_flat is not None:
+            p = p + max(0.0, w_conf) * (conf_flat + 1e-6)
+        if dyn_flat is not None:
+            p = p + max(0.0, w_dyn) * (dyn_flat + 1e-6)
+
+        # avoid degenerate
+        p = (p + 1e-8)
+        p = p / p.sum().clamp(min=1e-8)
+
+        # -------------------------
+        # Two-stage proposal:
+        #   1) pre-sample from p (bigger pool)
+        #   2) density-aware thinning (keep max-score per voxel)
+        #   3) multinomial again to final Ncand
+        # -------------------------
+        Ncand = int(min(max(1024, int(getattr(self.cfg, "imp_candidate_points", 200000))), N_total))
+
+        pre_factor = float(getattr(self.cfg, "imp_pre_sample_factor", 3.0))
+        keep_factor = float(getattr(self.cfg, "imp_thin_keep_factor", 2.0))
+
+        N_pre = int(min(N_total, max(Ncand, int(pre_factor * Ncand))))
+        # Pre-sample (non-diff proposal, fine)
+        pre_idx = torch.multinomial(p, num_samples=N_pre, replacement=False)  # [N_pre]
+
+        xyz_pre = flat_xyz_all[pre_idx]              # [N_pre,3]
+        p_pre = p[pre_idx].contiguous()              # [N_pre]
+
+        # Choose voxel_size adaptively from pre-sample bounding box
+        # heuristic: voxel_size ~ scene_diag / sqrt(Ncand) (scaled)
+        xyz_min = xyz_pre.amin(dim=0)
+        xyz_max = xyz_pre.amax(dim=0)
+        scene_diag = torch.norm((xyz_max - xyz_min).clamp(min=1e-9)).item()
+        voxel_ratio = float(getattr(self.cfg, "imp_voxel_ratio", 1.0))
+        min_vs = float(getattr(self.cfg, "imp_min_voxel_size", 1e-4))
+        voxel_size = max(min_vs, voxel_ratio * (scene_diag / (max(1.0, float(Ncand)) ** 0.5)))
+
+        # Thinning: keep best per voxel according to p_pre (you can use conf/dyn mixed score too)
+        keep_in_pre = _thin_by_voxel_keep_max(xyz_pre, p_pre, voxel_size=voxel_size)  # indices into pre pool
+
+        # Optionally cap thinning pool size for speed (if too many voxels)
+        N_thin_target = int(min(int(keep_factor * Ncand), int(keep_in_pre.numel())))
+        if keep_in_pre.numel() > N_thin_target:
+            # If thinning produced too many points, downsample them proportional to p_pre
+            p_keep = p_pre[keep_in_pre]
+            p_keep = (p_keep + 1e-8) / p_keep.sum().clamp(min=1e-8)
+            sub = torch.multinomial(p_keep, num_samples=N_thin_target, replacement=False)
+            keep_in_pre = keep_in_pre[sub]
+
+        thin_idx = pre_idx[keep_in_pre]       # indices into full set
+        p_thin = p[thin_idx].contiguous()
+        p_thin = (p_thin + 1e-8) / p_thin.sum().clamp(min=1e-8)
+
+        # Final candidates from thinned pool
+        if thin_idx.numel() <= Ncand:
+            cand_idx = thin_idx
+        else:
+            sel = torch.multinomial(p_thin, num_samples=Ncand, replacement=False)
+            cand_idx = thin_idx[sel]
+
+        xyz_cand = flat_xyz_all[cand_idx]  # [Ncand,3]
+
+        # ----- gather candidate feat from feat_red (needs mapping flat idx -> t,v,y,x, then to H',W') -----
+        # feat_red: [T,V,Hp,Wp,C], points_full: [T,V,H,W,3]
+        # decode flat index in TVHW
+        HW = int(H * W)
+        VHW = int(V * HW)
+        t_idx = (cand_idx // VHW).clamp(0, T - 1)
+        rem0 = cand_idx - t_idx * VHW
+        v_idx = (rem0 // HW).clamp(0, V - 1)
+        rem1 = rem0 - v_idx * HW
+        y_idx = (rem1 // W).clamp(0, H - 1)
+        x_idx = (rem1 - y_idx * W).clamp(0, W - 1)
+
+        # map (y,x) in image to (yp,xp) in feat map (Hp,Wp)
+        yp = ((y_idx.to(torch.long) * Hp) // max(1, H)).clamp(0, Hp - 1)
+        xp = ((x_idx.to(torch.long) * Wp) // max(1, W)).clamp(0, Wp - 1)
+
+        feat_cand = feat_red[t_idx, v_idx, yp, xp, :]  # [Ncand,C]
+
+        # ----- build importance head inputs -----
+        # time/view embedding (32 dims)
+        time_ids_long = time_ids.to(torch.long)
+        t_emb = self.imp_time_emb(time_ids_long[t_idx].clamp(min=0, max=self.imp_time_emb.num_embeddings - 1))
+        v_emb = self.imp_view_emb(v_idx.clamp(min=0, max=self.imp_view_emb.num_embeddings - 1))
+        pos_emb = torch.cat([t_emb, v_emb], dim=-1)  # [Ncand,32]
+
+        inputs = [feat_cand, pos_emb]
+        if bool(getattr(self.cfg, "imp_use_xyz", True)):
+            inputs.insert(1, xyz_cand)  # after feat
+        if bool(getattr(self.cfg, "imp_use_conf", True)):
+            if conf_flat is not None:
+                inputs.append(conf_flat[cand_idx].view(-1, 1))
+            else:
+                inputs.append(torch.zeros(Ncand, 1, device=device, dtype=dtype))
+        if bool(getattr(self.cfg, "imp_use_dyn", True)):
+            if dyn_flat is not None:
+                inputs.append(dyn_flat[cand_idx].view(-1, 1))
+            else:
+                inputs.append(torch.zeros(Ncand, 1, device=device, dtype=dtype))
+
+        imp_in = torch.cat(inputs, dim=-1)  # [Ncand, D]
+        imp_logits = self.imp_head(imp_in).squeeze(-1)  # [Ncand]
+
+        # ----- differentiable top-k selection (ST) -----
+        tau = float(kwargs.get("imp_gumbel_tau", getattr(self.cfg, "imp_gumbel_tau", 1.0)))
+        tau_min = float(getattr(self.cfg, "imp_tau_min", 0.2))
+        tau = max(tau_min, tau)  # you can anneal in training by editing cfg.imp_gumbel_tau each epoch
+
+        if self.training:
+            idx_hard, y_st = _gumbel_topk_straight_through_sparse(imp_logits, k=M_full, tau=tau)
+        else:
+            N = int(imp_logits.shape[0])
+            k = int(min(max(1, M_full), N))
+            y = imp_logits / float(max(1e-6, tau))
+            idx_hard = torch.topk(y, k=k, largest=True).indices
+            y_st = y[idx_hard]
+        # forward: hard index selection
+        xyz_f0 = xyz_cand[idx_hard]  # [M,3]
+
+        # ----- p_dyn_f: also selected sparsely -----
+        if dyn_flat is not None:
+            dyn_cand = dyn_flat[cand_idx].view(-1, 1)  # [Ncand,1]
+            p_dyn_f = dyn_cand[idx_hard].clamp(0.0, 1.0)  # [M,1]
+        else:
+            p_dyn_f = torch.full((M_full, 1), 0.5, device=device, dtype=dtype)
+
+        # ============================================================
+        # Stage C2/C3: soft assignment → distribute anchor motion to selected fine points
+        # ============================================================
         if Md > 0:
             idx_d, w_d = _soft_assign_topk(
                 xyz_f0,
@@ -815,13 +1079,14 @@ class Trellis4DGS4DCanonical(nn.Module):
             w_d = torch.zeros(M_full, 0, device=device, dtype=dtype)
             dxyz_f = torch.zeros(T, M_full, 3, device=device, dtype=dtype)
 
+        # gate motion by dynamic probability
         dxyz_f = dxyz_f * p_dyn_f.view(1, M_full, 1)
 
         # Step 7: residual motion（可选）
         if self.residual_motion_head is not None:
             z_f = self.point_aggregator(
                 xyz_f0,
-                feat_red[0:1],
+                feat_red[0:1],             # use t=0 features for residual input; ok
                 camera_poses[0:1],
                 camera_intrinsics[0:1],
                 time_ids[0:1],
@@ -833,11 +1098,16 @@ class Trellis4DGS4DCanonical(nn.Module):
 
         mu_t = xyz_f0.unsqueeze(0) + dxyz_f  # [T,M,3]
 
+
         # Step 4/5: 聚合外观特征 → 解码 Gaussian 属性（不改几何）
         g = self.point_aggregator(xyz_f0, feat_red, camera_poses, camera_intrinsics, time_ids)  # [M,C]
         gauss = self.gaussian_head(g)
+        # scale 有界化：避免直接 clamp(max) 导致触顶后梯度为 0（scale_t“学不动”）
         max_scale = float(getattr(self.cfg, "max_scale", 0.05))
-        gauss["scale"] = gauss["scale"].clamp(max=max_scale)
+        min_scale = float(getattr(self.cfg, "min_scale", 1e-4))
+        # gaussian_head 里 scale 用 softplus 输出，可能远大于 max_scale；用 sigmoid 压到 (0,1) 再映射到 [min,max]
+        s01 = torch.sigmoid(gauss["scale"])
+        gauss["scale"] = (min_scale + (max_scale - min_scale) * s01).clamp(min=min_scale, max=max_scale)
 
         color_t = gauss["color"].unsqueeze(0).expand(T, -1, -1)
         alpha_t = gauss["opacity"].unsqueeze(0).expand(T, -1, -1)
@@ -858,6 +1128,9 @@ class Trellis4DGS4DCanonical(nn.Module):
             "assign_idx_dynamic": idx_d,
             "assign_w_dynamic": w_d,
             "p_dyn_f": p_dyn_f,
+            # optional debug/regularization hooks
+            "xyz_f0": xyz_f0,
+            "imp_logits": imp_logits,
         }
 
 

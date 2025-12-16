@@ -403,6 +403,8 @@ def train_epoch(
     sum_motion = 0.0
     sum_temporal = 0.0
     sum_imp_budget = 0.0
+    sum_imp_entropy = 0.0
+    sum_imp_repel = 0.0
     n_batches = 0
 
     last_rendered_images = None
@@ -865,62 +867,54 @@ def train_epoch(
         lw = config.get('loss_weights', {})
         w_photo = float(lw.get('photo_l1', 1.0))
         w_ssim = float(lw.get('ssim', 0.0))
+        w_sil = float(lw.get('silhouette', 0.0))
         w_alpha = float(lw.get('alpha_l1', 0.0))
         w_chamfer = float(lw.get('chamfer', 0.0))
         w_motion = float(lw.get('motion_reg', 0.0))
-        # alignment loss（GS -> points_full）
-        w_imp_geom = float(lw.get('imp_geom', 1.0))
-        # optical flow reprojection
-        w_flow_reproj = float(lw.get('flow_reproj', 0.0))
-        # 强烈建议删除/关闭的项不再读取：w_sil、mask_*、entropy/repel
-        w_dyn = 0.0
-        w_sta = 0.0
-        w_cross = 0.0
-        # Stage C: importance stabilizer（仅 stage1 小权重）
+        w_temp_vel = float(lw.get('temporal_vel', 0.0))
+        w_temp_acc = float(lw.get('temporal_acc', 0.0))
+        w_cycle = float(lw.get('cycle_consistency', 0.0))
+        w_dyn = float(lw.get('mask_dyn', 0.0))
+        w_sta = float(lw.get('mask_sta', 0.0))
+        w_cross = float(lw.get('mask_cross', 0.0))
+        # Stage C: differentiable importance selector regularization (默认 0，不影响现有训练)
         w_imp_budget = float(lw.get("imp_budget", 0.0))
-        w_imp_entropy = 0.0
-        w_imp_repel = 0.0
+        w_imp_entropy = float(lw.get("imp_entropy", 0.0))
+        w_imp_repel = float(lw.get("imp_repel", 0.0))
 
         # Hard stage gating (clear and explicit)
         if stage == 1:
-            # 开启：photo、(可选)ssim、弱 alpha、importance 三项 + 几何对齐 + 早期 Chamfer
-            # 关闭：motion / temporal / 所有 mask
+            # 开启：photo、(可选)ssim、弱 alpha、importance 三项
+            # 关闭：motion / temporal / chamfer / 所有 mask
             w_motion = 0.0
             lambda_smooth = 0.0
-            w_chamfer = 0.1
+            w_chamfer = 0.0
             w_dyn = 0.0
             w_sta = 0.0
             w_cross = 0.0
-            # importance 稳定器（Stage1 仅小权重）
-            w_imp_budget = 0.1
-            w_imp_entropy = 0.0
-            w_imp_repel = 0.0
-            # 对齐损失强化
-            w_imp_geom = 1.0
-            w_flow_reproj = 0.0
+            # importance 正则（Stage1 强）：
+            w_imp_budget = 1.0
+            w_imp_entropy = 0.1
+            w_imp_repel = 0.01
         elif stage == 2:
-            # 开启：photo、motion、temporal；importance 仅保留很小预算；Chm=0.05；alignment 继续保留但减弱
-            w_imp_budget = 0.05
+            # 开启：photo、motion、temporal；importance 仅保留很小预算；关闭 chamfer
+            w_imp_budget = 0.1
             w_imp_entropy = 0.0
             w_imp_repel = 0.0
             w_motion = 1.0
             lambda_smooth = 0.1
-            w_chamfer = 0.05
-            w_imp_geom = 0.5
-            w_flow_reproj = 1.0
+            w_chamfer = 0.0
             w_dyn = 0.0
             w_sta = 0.0
             w_cross = 0.0
         else:  # stage 3
-            # 开启：photo、motion、residual 正则、极小 chamfer；关闭所有 importance 正则；alignment 保留极小
+            # 开启：photo、motion、residual 正则、极小 chamfer；关闭所有 importance 正则
             w_imp_budget = 0.0
             w_imp_entropy = 0.0
             w_imp_repel = 0.0
             w_motion = 1.0
             lambda_smooth = 0.1
             w_chamfer = 0.01
-            w_imp_geom = 0.2
-            w_flow_reproj = 1.0
             w_dyn = 0.0
             w_sta = 0.0
             w_cross = 0.0
@@ -1019,73 +1013,6 @@ def train_epoch(
             else:
                 motion_reg = (dxyz_t.pow(2).sum(dim=2).mean())
 
-        # A. Importance–Geometry alignment: GS -> points_full single-sided Chamfer
-        imp_geom_loss = torch.tensor(0.0, device=device)
-        if points is not None and w_imp_geom > 0.0:
-            # points: [T,V,H,W,3]
-            Nsub = int(config.get('loss_params', {}).get('imp_geom_max_points', 4096))
-            for t in range(T):
-                mu = mu_t[t]  # [M,3]
-                pts_t = points[t].reshape(-1, 3)
-                pts_t = torch.nan_to_num(pts_t, nan=0.0, posinf=0.0, neginf=0.0)
-                n_all = int(pts_t.shape[0])
-                if n_all == 0 or mu.numel() == 0:
-                    continue
-                k = int(min(max(1, Nsub), n_all))
-                idx = torch.randperm(n_all, device=device)[:k]
-                pts_sub = pts_t[idx].to(dtype=torch.float32)
-                mu32 = mu.to(dtype=torch.float32)
-                d = torch.cdist(mu32, pts_sub, p=2.0)  # [M,k]
-                imp_geom_loss = imp_geom_loss + d.min(dim=1).values.mean().to(device=device, dtype=mu.dtype)
-            imp_geom_loss = imp_geom_loss / max(1, T)
-
-        # D. Motion flow reprojection loss using SegAnyMo dynamic_traj_tv (if available)
-        flow_reproj_loss = torch.tensor(0.0, device=device)
-        dyn_traj_tv = batch_data.get('dynamic_traj_tv', None)  # [T,V,2,H,W]
-        if dyn_traj_tv is not None and mu_t.shape[0] >= 2:
-            H_img, W_img = config['data']['image_size']
-            def proj_uv(Xw, c2w, K):
-                M_ = Xw.shape[0]
-                ones = torch.ones(M_, 1, device=Xw.device, dtype=Xw.dtype)
-                Xh = torch.cat([Xw, ones], dim=1)
-                w2c = torch.inverse(c2w)
-                Xc = (w2c @ Xh.t()).t()[:, :3]
-                z = Xc[:, 2]
-                uvw = (K @ Xc.t()).t()
-                u = uvw[:, 0] / uvw[:, 2].clamp(min=1e-6)
-                v = uvw[:, 1] / uvw[:, 2].clamp(min=1e-6)
-                return u, v, z
-            p_dyn = output.get('p_dyn_f', None)  # [M,1] or None
-            acc = 0.0
-            cnt = 0
-            for t in range(T - 1):
-                for v in range(camera_poses_seq.shape[1]):
-                    u0, v0, z0 = proj_uv(mu_t[t], camera_poses_seq[t, v], camera_intrinsics_seq[t, v])
-                    u1, v1, z1 = proj_uv(mu_t[t+1], camera_poses_seq[t+1, v], camera_intrinsics_seq[t+1, v])
-                    in0 = (z0 > 1e-4) & (u0 >= 0) & (u0 < W_img) & (v0 >= 0) & (v0 < H_img)
-                    in1 = (z1 > 1e-4) & (u1 >= 0) & (u1 < W_img) & (v1 >= 0) & (v1 < H_img)
-                    valid = in0 & in1
-                    if valid.sum() == 0:
-                        continue
-                    flow_pred = torch.stack([u1 - u0, v1 - v0], dim=-1)  # [M,2]
-                    # sample GT flow at (u0,v0)
-                    flow_gt = dyn_traj_tv[t, v].to(device=flow_pred.device, dtype=flow_pred.dtype)  # [2,H,W]
-                    grid_x = 2.0 * (u0[valid] / max(1, W_img - 1)) - 1.0
-                    grid_y = 2.0 * (v0[valid] / max(1, H_img - 1)) - 1.0
-                    grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
-                    flow_gt_bchw = flow_gt.unsqueeze(0)
-                    samp = torch.nn.functional.grid_sample(flow_gt_bchw, grid, mode='bilinear', align_corners=True)
-                    flow_gt_pts = samp.squeeze(0).squeeze(-1).permute(1, 0)  # [Q,2]
-                    err = torch.abs(flow_pred[valid] - flow_gt_pts)
-                    if p_dyn is not None:
-                        w = p_dyn.squeeze(-1)[valid].clamp(0.0, 1.0)
-                        acc = acc + (w.unsqueeze(-1) * err).mean()
-                    else:
-                        acc = acc + err.mean()
-                    cnt += 1
-            if cnt > 0:
-                flow_reproj_loss = acc / float(cnt)
-
         # Stage 3: residual motion regularization (stronger than anchor motion)
         w_res_mag = float(stage_cfg.get("stage3_residual_mag", 0.0)) if stage == 3 else 0.0
         w_res_smooth = float(stage_cfg.get("stage3_residual_smooth", 0.0)) if stage == 3 else 0.0
@@ -1160,26 +1087,55 @@ def train_epoch(
             x_next = mu_t[2:]
             temporal_smooth = ((x_next - 2 * x_curr + x_prev) ** 2).mean()
 
-        # ----- Importance budget only (entropy/repel disabled by default) -----
+        # ----- Stage C regularization (budget/entropy + repulsion) -----
         imp_budget_loss = torch.tensor(0.0, device=device)
+        imp_entropy_loss = torch.tensor(0.0, device=device)
+        imp_repel_loss = torch.tensor(0.0, device=device)
+
         imp_logits = output.get("imp_logits", None)
-        if imp_logits is not None and (w_imp_budget > 0.0):
+        if imp_logits is not None and (w_imp_budget > 0.0 or w_imp_entropy > 0.0):
             imp_probs = torch.sigmoid(imp_logits)
+            # 让 probs 的均值接近预算比例，避免 logits 全饱和（硬选 k 固定，主要是 stabilizer）
             target = float(mu_t.shape[1]) / float(max(1, imp_probs.numel()))
             imp_budget_loss = (imp_probs.mean() - target) ** 2
+            # 最大化熵：loss = -H(p)
+            eps = 1e-8
+            ent = -(imp_probs * torch.log(imp_probs + eps) + (1.0 - imp_probs) * torch.log(1.0 - imp_probs + eps))
+            imp_entropy_loss = -ent.mean()
+
+        xyz_f0 = output.get("xyz_f0", None)
+        if xyz_f0 is not None and w_imp_repel > 0.0:
+            rp_cfg = config.get("loss_params", {}).get("imp_repel", {}) or {}
+            rp_num = int(rp_cfg.get("num_points", 4096))
+            rp_knn = int(rp_cfg.get("knn", 8))
+            rp_sigma = float(rp_cfg.get("sigma", 0.05))
+            rp_num = int(min(max(0, rp_num), int(xyz_f0.shape[0])))
+            rp_knn = int(min(max(1, rp_knn), max(1, rp_num - 1)))
+            if rp_num >= 2 and rp_sigma > 0:
+                idx = torch.randperm(int(xyz_f0.shape[0]), device=xyz_f0.device)[:rp_num]
+                x = xyz_f0[idx].to(dtype=torch.float32)
+                d2 = torch.cdist(x, x, p=2.0).pow(2)
+                d2 = d2 + torch.eye(rp_num, device=d2.device, dtype=d2.dtype) * 1e6
+                knn_d2 = torch.topk(d2, k=rp_knn, dim=-1, largest=False).values
+                sigma2 = float(max(1e-8, rp_sigma * rp_sigma))
+                imp_repel_loss = torch.exp(-knn_d2 / sigma2).mean().to(device=device, dtype=mu_t.dtype)
 
         loss = (
             w_photo * photo_loss +
             w_ssim * ssim_loss +
+            w_sil * sil_loss +
             w_alpha * alpha_sparse +
             w_chamfer * chamfer_loss +
             w_motion * motion_reg +
-            lambda_smooth * temporal_smooth +
-            w_res_mag * res_mag +
-            w_res_smooth * res_smooth +
-            w_imp_budget * imp_budget_loss +
-            w_imp_geom * imp_geom_loss +
-            w_flow_reproj * flow_reproj_loss
+            lambda_smooth * temporal_smooth
+            + w_dyn * mask_dyn_loss
+            + w_sta * mask_sta_loss
+            + w_cross * mask_cross_loss
+            + w_res_mag * res_mag
+            + w_res_smooth * res_smooth
+            + w_imp_budget * imp_budget_loss
+            + w_imp_entropy * imp_entropy_loss
+            + w_imp_repel * imp_repel_loss
         )
         #【TODO】将rendered_images 和 gt_images [4, 4, 3, 378, 504]绘制在一张大图上，大图两行每行 16 张图
         # rendered_images_concat = torch.cat([rendered_images, gt_images], dim=0).view(32, 3, 378, 504)
@@ -1200,6 +1156,8 @@ def train_epoch(
         sum_motion += float(motion_reg.item())
         sum_temporal += float(temporal_smooth.item())
         sum_imp_budget += float(imp_budget_loss.item())
+        sum_imp_entropy += float(imp_entropy_loss.item())
+        sum_imp_repel += float(imp_repel_loss.item())
         n_batches += 1
 
         # Save last batch artifacts (after streaming, rendered_images 不再存在)
@@ -1226,6 +1184,8 @@ def train_epoch(
             writer.add_scalar('Loss/MotionReg', sum_motion / denom, global_step)
             writer.add_scalar('Loss/TemporalSmooth', sum_temporal / denom, global_step)
             writer.add_scalar("Loss/ImpBudget", sum_imp_budget / denom, global_step)
+            writer.add_scalar("Loss/ImpEntropy", sum_imp_entropy / denom, global_step)
+            writer.add_scalar("Loss/ImpRepel", sum_imp_repel / denom, global_step)
             if do_color_init:
                 # 记录当前退火系数（越大越依赖 init_sh0）
                 if blend_steps > 0:
@@ -1347,6 +1307,8 @@ def train_epoch(
         'motion_reg': sum_motion / denom,
         'temporal_smooth': sum_temporal / denom,
         "imp_budget_loss": sum_imp_budget / denom,
+        "imp_entropy_loss": sum_imp_entropy / denom,
+        "imp_repel_loss": sum_imp_repel / denom,
     }
 
 

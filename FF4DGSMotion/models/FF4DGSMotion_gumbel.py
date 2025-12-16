@@ -73,6 +73,66 @@ def _soft_assign_topk(
     return idx_out, w_out
 
 
+def _thin_by_voxel_keep_max(
+    xyz: torch.Tensor,      # [N,3]
+    score: torch.Tensor,    # [N]
+    voxel_size: float,
+    eps_tie: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Density-aware thinning without reconstruction:
+    - compute voxel index = floor(xyz / voxel_size)
+    - hash voxel index to 1D
+    - keep the point with max(score) per voxel (tie-broken by tiny noise)
+
+    returns:
+        keep_idx: [M] indices into xyz (M <= N)
+    """
+    if xyz.numel() == 0:
+        return torch.zeros(0, device=xyz.device, dtype=torch.long)
+    if xyz.dim() != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
+    if score.dim() != 1 or score.shape[0] != xyz.shape[0]:
+        raise ValueError(f"score must be [N], got {tuple(score.shape)} vs N={xyz.shape[0]}")
+
+    N = int(xyz.shape[0])
+    device = xyz.device
+
+    vs = float(max(1e-9, voxel_size))
+    # anchor to min to avoid huge indices
+    xyz_min = xyz.amin(dim=0, keepdim=True)
+    vidx = torch.floor((xyz - xyz_min) / vs).to(torch.int64)  # [N,3]
+
+    # simple 3D hash to 1D
+    hx = vidx[:, 0] * 73856093
+    hy = vidx[:, 1] * 19349663
+    hz = vidx[:, 2] * 83492791
+    h = (hx ^ hy ^ hz)  # [N]
+
+    uniq_h, inv = torch.unique(h, return_inverse=True)
+    num_vox = int(uniq_h.shape[0])
+
+    # tie-break with tiny noise
+    score2 = score + eps_tie * torch.rand_like(score)
+
+    max_per_vox = torch.full((num_vox,), -1e30, device=device, dtype=score2.dtype)
+    max_per_vox.scatter_reduce_(0, inv, score2, reduce="amax", include_self=True)
+
+    keep_mask = score2 >= (max_per_vox[inv] - 1e-12)
+    keep_idx = torch.nonzero(keep_mask, as_tuple=False).view(-1)
+
+    if keep_idx.numel() > num_vox:
+        h_keep = h[keep_idx]
+        order = torch.argsort(h_keep)
+        keep_idx = keep_idx[order]
+        h_keep = h_keep[order]
+        new_vox = torch.ones_like(h_keep, dtype=torch.bool)
+        new_vox[1:] = h_keep[1:] != h_keep[:-1]
+        keep_idx = keep_idx[new_vox]
+
+    return keep_idx
+
+
 def _sample_gumbel(shape, device, dtype, eps=1e-8):
     u = torch.rand(shape, device=device, dtype=dtype)
     return -torch.log(-torch.log(u.clamp(min=eps, max=1.0 - eps)))
@@ -544,7 +604,7 @@ class ModelCfg:
     slot_iters: int = 3
 
     coarse_stride: int = 8
-    fine_num_points: int = 30000
+    fine_num_points: int = 100000
     fine_sample_mode: str = "topk_conf"  # ["topk_conf","random"]
     assign_topk: int = 8
     assign_sigma: float = 0.05
@@ -559,6 +619,11 @@ class ModelCfg:
     imp_mix_conf: float = 0.6            # proposal 分布：conf 权重
     imp_mix_dyn: float = 0.2             # proposal 分布：dyn 权重（若有）
     imp_tau_min: float = 0.2             # 可选：训练后期最小 tau
+    # Proposal / thinning (two-stage proposal)
+    imp_pre_sample_factor: float = 3.0    # N_pre = factor * Ncand
+    imp_thin_keep_factor: float = 2.0     # N_thin target = keep_factor * Ncand
+    imp_voxel_ratio: float = 1.0          # voxel_size multiplier
+    imp_min_voxel_size: float = 1e-4      # minimum voxel size to avoid zero
     # Safety cap for slot-attention tokens (coarse branch). Prevents OOM in [B,N,M] attention.
     max_coarse_tokens: int = 8000
 
@@ -879,8 +944,55 @@ class Trellis4DGS4DCanonical(nn.Module):
         p = (p + 1e-8)
         p = p / p.sum().clamp(min=1e-8)
 
+        # -------------------------
+        # Two-stage proposal:
+        #   1) pre-sample from p (bigger pool)
+        #   2) density-aware thinning (keep max-score per voxel)
+        #   3) multinomial again to final Ncand
+        # -------------------------
         Ncand = int(min(max(1024, int(getattr(self.cfg, "imp_candidate_points", 200000))), N_total))
-        cand_idx = torch.multinomial(p, num_samples=Ncand, replacement=False)  # [Ncand] (proposal; ok to be non-diff)
+
+        pre_factor = float(getattr(self.cfg, "imp_pre_sample_factor", 3.0))
+        keep_factor = float(getattr(self.cfg, "imp_thin_keep_factor", 2.0))
+
+        N_pre = int(min(N_total, max(Ncand, int(pre_factor * Ncand))))
+        # Pre-sample (non-diff proposal, fine)
+        pre_idx = torch.multinomial(p, num_samples=N_pre, replacement=False)  # [N_pre]
+
+        xyz_pre = flat_xyz_all[pre_idx]              # [N_pre,3]
+        p_pre = p[pre_idx].contiguous()              # [N_pre]
+
+        # Choose voxel_size adaptively from pre-sample bounding box
+        # heuristic: voxel_size ~ scene_diag / sqrt(Ncand) (scaled)
+        xyz_min = xyz_pre.amin(dim=0)
+        xyz_max = xyz_pre.amax(dim=0)
+        scene_diag = torch.norm((xyz_max - xyz_min).clamp(min=1e-9)).item()
+        voxel_ratio = float(getattr(self.cfg, "imp_voxel_ratio", 1.0))
+        min_vs = float(getattr(self.cfg, "imp_min_voxel_size", 1e-4))
+        voxel_size = max(min_vs, voxel_ratio * (scene_diag / (max(1.0, float(Ncand)) ** 0.5)))
+
+        # Thinning: keep best per voxel according to p_pre (you can use conf/dyn mixed score too)
+        keep_in_pre = _thin_by_voxel_keep_max(xyz_pre, p_pre, voxel_size=voxel_size)  # indices into pre pool
+
+        # Optionally cap thinning pool size for speed (if too many voxels)
+        N_thin_target = int(min(int(keep_factor * Ncand), int(keep_in_pre.numel())))
+        if keep_in_pre.numel() > N_thin_target:
+            # If thinning produced too many points, downsample them proportional to p_pre
+            p_keep = p_pre[keep_in_pre]
+            p_keep = (p_keep + 1e-8) / p_keep.sum().clamp(min=1e-8)
+            sub = torch.multinomial(p_keep, num_samples=N_thin_target, replacement=False)
+            keep_in_pre = keep_in_pre[sub]
+
+        thin_idx = pre_idx[keep_in_pre]       # indices into full set
+        p_thin = p[thin_idx].contiguous()
+        p_thin = (p_thin + 1e-8) / p_thin.sum().clamp(min=1e-8)
+
+        # Final candidates from thinned pool
+        if thin_idx.numel() <= Ncand:
+            cand_idx = thin_idx
+        else:
+            sel = torch.multinomial(p_thin, num_samples=Ncand, replacement=False)
+            cand_idx = thin_idx[sel]
 
         xyz_cand = flat_xyz_all[cand_idx]  # [Ncand,3]
 

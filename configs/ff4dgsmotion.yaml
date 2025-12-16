@@ -54,7 +54,7 @@ model:
   # 当 fine_num_points 很大（例如 100k）时，避免 MHA/SDPA 触发 CUDA invalid configuration
   point_agg_chunk: 25000
 training:
-  num_epochs: 300
+  num_epochs: 500
   num_frames: 6
   sequence_length: 6
   num_workers: 0

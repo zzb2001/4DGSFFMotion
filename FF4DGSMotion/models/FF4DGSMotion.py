@@ -749,6 +749,7 @@ class Trellis4DGS4DCanonical(nn.Module):
         time_ids: Optional[torch.Tensor] = None,      # [T]
         dyn_mask_2d: Optional[torch.Tensor] = None,   # [T,V,H,W] or [T,V,H,W,1]
         conf_2d: Optional[torch.Tensor] = None,       # [T,V,H,W] or [T,V,H,W,1]
+        freeze_canonical: bool = False,
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         if points_full is None:
@@ -839,9 +840,11 @@ class Trellis4DGS4DCanonical(nn.Module):
             Nc = int(max_tokens)
 
         # Step 2: Dual Slot Prior（canonical anchors）
+        token_xyz_in = token_xyz.detach() if freeze_canonical else token_xyz
+
         anchors = self.dual_slot_prior(
             token_feat=token_feat,
-            token_xyz=token_xyz,
+            token_xyz=token_xyz_in,
             token_p_dyn=token_p_dyn,
             token_p_vis=token_p_vis,
         )

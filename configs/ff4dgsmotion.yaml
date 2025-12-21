@@ -95,8 +95,8 @@ training:
 
   # 三阶段训练调度（按 epoch）
   stages:
-    stage1_epochs: 50
-    stage2_epochs: 100
+    stage1_epochs: 140
+    stage2_epochs: 155
   # Stage3 residual loss（仅当 model.use_residual_motion=true 且输出 dxyz_t_res 时生效）
   stage3_residual_mag: 0.5
   stage3_residual_smooth: 0.1
@@ -154,7 +154,7 @@ data:
   reloc3r_dir: "/home/star/zzb/reloc3r/results/beef_20views_sample4"  # Path to Reloc3r 
   image_size: [378, 504]
   # 预加载采样间隔：对应日志 "sampling every {sample_interval} steps"
-  sample_interval: 30
+  sample_interval: 20
   preload_all: true
   use_sim3_normalize: false
   ex4dgs_dir: /home/star/zzb/Pi3/assets/Ex4DGS

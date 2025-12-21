@@ -4,6 +4,7 @@ Training script for Baseline 4DGS (GaussianTransformerBaselineModel)
 - Trains only with image supervision (L1/SSIM via PhotoConsistencyLoss) and optional temporal smoothness
 """
 import os
+from torchvision.utils import save_image
 import time
 import argparse
 import random
@@ -26,8 +27,9 @@ from safetensors.torch import load_file
 import json
 import os
 from PIL import Image
-from torchvision.utils import save_image
+# save_image already imported
 import math
+from torchvision.utils import save_image
 from typing import List
 
 from FF4DGSMotion.data.dataset import VoxelFF4DGSDataset
@@ -39,7 +41,27 @@ import torch.nn.functional as F
 from FF4DGSMotion.camera.camera import IntrinsicsCamera
 from FF4DGSMotion.diff_renderer.gaussian import render_gs, GaussianAttributes
 from FF4DGSMotion.models._utils import matrix_to_quaternion, rgb2sh0
-
+def _save_grid_6x4(x: torch.Tensor, name: str):
+    """Save 6x4 grid (6 cols × 4 rows) single-channel debug image.
+    Args:
+        x: Tensor [6,4,H,W] or [6,4,H,W,1]
+        name: filename (without extension) under debug/images/
+    """
+    if x is None:
+        return
+    if x.dim() == 5 and x.shape[-1] == 1:
+        x = x.squeeze(-1)
+    if x.dim() != 4:
+        print(f"[debug] skip {name}, unexpected shape {tuple(x.shape)}")
+        return
+    try:
+        # [6,4,H,W] -> [4,6,H,W] -> [24,1,H,W]
+        x_cpu = x.detach().cpu()
+        x_cpu = x_cpu.permute(1, 0, 2, 3).contiguous()
+        x_cpu = x_cpu.view(-1, 1, x_cpu.shape[-2], x_cpu.shape[-1])
+        save_image(x_cpu, f"debug/images/{name}.png", nrow=6, normalize=True)
+    except Exception as e:
+        print(f"[debug] failed to save {name}: {e}")
 def _gaussian(window_size: int, sigma: float, device: torch.device, dtype: torch.dtype):
     gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)]).to(device=device, dtype=dtype)
     return gauss/gauss.sum()
@@ -406,8 +428,15 @@ def train_epoch(
     sum_imp_geom = 0.0
     sum_exist_budget = 0.0
     sum_flow_reproj = 0.0
+    sum_mask_dyn = 0.0
+    sum_mask_sta = 0.0
+    sum_mask_cross = 0.0
     sum_res_mag = 0.0
     sum_res_smooth = 0.0
+    sum_imp_entropy = 0.0
+    sum_imp_repel = 0.0
+    # stage indicator for pretty printing
+    current_stage = None
     n_batches = 0
 
     last_rendered_images = None
@@ -430,6 +459,8 @@ def train_epoch(
         stage = 2
     else:
         stage = 3
+    current_stage = stage
+    freeze_canonical = True if stage == 1 else False
 
     # Adjust optimizer LR for importance head at Stage 3 (0.1x)
     def _set_imp_lr(scale: float):
@@ -502,6 +533,20 @@ def train_epoch(
             config=config, mode='train'
         )
         points = batch_data.get('points', None)
+
+        # --- 检验函数 debug save of batch inputs (first batch only) ---
+        # if epoch == 0 and batch_idx == 0:
+        #     def _dbg_save(x: torch.Tensor | None, name: str):
+        #         if x is None:
+        #             return
+        #         try:
+        #             _save_grid_6x4(x[:6, :4], name)
+        #         except Exception:
+        #             pass
+        #     _dbg_save(batch_data.get('conf', None), 'conf')
+        #     _dbg_save(batch_data.get('conf_prob', None), 'conf_prob')
+        #     _dbg_save(batch_data.get('silhouette', None), 'silhouette')
+        #     _dbg_save(batch_data.get('dynamic_conf_tv', None), 'dynamic_conf_tv')
         points_3d = batch_data['points_3d']
         feat_2d = batch_data['feat_2d']
         conf_seq = batch_data['conf']
@@ -521,6 +566,7 @@ def train_epoch(
         with use_amp_ctx:
             dyn_mask_in = dyn_mask_tv if dyn_mask_tv is not None else silhouette
             output = model(
+                freeze_canonical=freeze_canonical,
                 points_full=points,
                 feat_2d=feat_2d,
                 camera_poses=camera_poses_seq,
@@ -1160,6 +1206,14 @@ def train_epoch(
         sum_motion += float(motion_reg.item())
         sum_temporal += float(temporal_smooth.item())
         sum_imp_budget += float(imp_budget_loss.item())
+        # optional losses
+        sum_mask_dyn += float(mask_dyn_loss.item())
+        sum_mask_sta += float(mask_sta_loss.item())
+        sum_mask_cross += float(mask_cross_loss.item())
+        sum_res_mag += float(res_mag.item())
+        sum_res_smooth += float(res_smooth.item())
+        sum_imp_entropy += float(imp_entropy_loss.item() if 'imp_entropy_loss' in locals() else 0.0)
+        sum_imp_repel += float(imp_repel_loss.item() if 'imp_repel_loss' in locals() else 0.0)
 
         n_batches += 1
 
@@ -1298,7 +1352,7 @@ def train_epoch(
                 save_gaussians_ply(gaussian_dict, ply_path, sh_degree=0)
 
     denom = max(1, n_batches)
-    return {
+    metrics: dict[str, float | int] = {
         'loss': total_loss / denom,
         'photo_loss': sum_photo / denom,
         'ssim_loss': sum_ssim / denom,
@@ -1308,9 +1362,17 @@ def train_epoch(
         'chamfer_loss': sum_chamfer / denom,
         'motion_reg': sum_motion / denom,
         'temporal_smooth': sum_temporal / denom,
-        "imp_budget_loss": sum_imp_budget / denom,
-
+        'imp_budget_loss': sum_imp_budget / denom,
+        'mask_dyn_loss': sum_mask_dyn / denom,
+        'mask_sta_loss': sum_mask_sta / denom,
+        'mask_cross_loss': sum_mask_cross / denom,
+        'residual_mag': sum_res_mag / denom,
+        'residual_smooth': sum_res_smooth / denom,
+        'imp_entropy_loss': sum_imp_entropy / denom,
+        'imp_repel_loss': sum_imp_repel / denom,
+        'stage': current_stage,
     }
+    return metrics
 
 
 def validate(
@@ -1365,6 +1427,7 @@ def validate(
 
             dyn_mask_in = dyn_mask_tv if dyn_mask_tv is not None else silhouette
             output = model(
+                freeze_canonical=False,
                 points_full=points,
                 feat_2d=feat_2d,
                 camera_poses=camera_poses_seq,
@@ -1686,9 +1749,16 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
         image_dir=data_cfg.get("image_dir", None),
     )
 
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # Deterministic, non-overlapping split by contiguous indices to avoid any
+    # possible window overlap between train/val (especially when windows use
+    # consecutive time steps). We take the first 90% samples for training and
+    # the remaining 10% for validation.
+    _total = len(dataset)
+    train_size = int(0.9 * _total)
+    train_indices = list(range(0, train_size))
+    val_indices = list(range(train_size, _total))
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
 
     # TimeWindowSampler keeps time steps consecutive
     from FF4DGSMotion.data.dataset import TimeWindowSampler, WindowBatchSampler
@@ -1719,17 +1789,41 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
     # Validation loader (rank0 only to save compute)
     val_loader = None
     if is_rank0:
-        T_training = sequence_length
-        val_batch_size = args.batch_size if args.batch_size is not None else T_training
+        from FF4DGSMotion.data.dataset import TimeWindowSampler, WindowBatchSampler
+        # Ensure we have at least one validation window even when val set shorter than training window_size
+        val_window_size = min(window_size, len(val_dataset)) if len(val_dataset) > 0 else 0
+        if val_window_size == 0:
+            val_loader = None
+        else:
+            val_window_sampler = TimeWindowSampler(val_dataset, window_size=val_window_size, shuffle=False)
+            # If dataset too sparse (e.g., large sample_interval), sampler may yield 0 windows.
+            has_windows = len(getattr(val_window_sampler, "windows", list(val_window_sampler))) > 0
+            if has_windows:
+                val_batch_sampler = WindowBatchSampler(val_window_sampler, shuffle=False)
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_sampler=val_batch_sampler,
+                    num_workers=int(config['training']['num_workers']),
+                    multiprocessing_context=mp_ctx,
+                    pin_memory=torch.cuda.is_available(),
+                )
+            else:
+                # Fallback: simple sequential loader with batch_size = 1
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=int(config['training']['num_workers']),
+                    multiprocessing_context=mp_ctx,
+                    pin_memory=torch.cuda.is_available(),
+                )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=val_batch_size,
-            shuffle=False,
+            batch_sampler=val_batch_sampler,
             num_workers=int(config['training']['num_workers']),
             multiprocessing_context=mp_ctx,
             pin_memory=torch.cuda.is_available(),
         )
-
     # Model
     mc = config.get('model', {})
     model = Trellis4DGS4DCanonical(cfg=mc).to(device)
@@ -1801,8 +1895,20 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
         # Only rank0 runs validation + saves checkpoints
         if is_rank0:
             # pretty print non-zero train metrics
-            def _fmt_metrics(title: str, m: dict, keys: list[str], tol: float = 1e-8) -> str:
+            def _fmt_metrics(title: str, m: dict, keys: list[str] | None = None, tol: float = 1e-8) -> str:
+                """Pretty-print metrics.
+                If *keys* is None, print every key in *m* (except 'loss'/'stage').
+                Only values with absolute magnitude larger than *tol* are shown.
+                Additionally, the current *stage* (if present in *m*) will be
+                appended to *title* so the caller doesn’t have to manually
+                include it.
+                """
+                stage = m.get('stage', None)
+                if stage is not None:
+                    title = f"{title}(Stage {int(stage)})"
                 parts = [f"{title}: {m.get('loss', 0.0):.4f}"]
+                if keys is None:
+                    keys = [k for k in m.keys() if k not in ('loss', 'stage')]
                 for k in keys:
                     v = float(m.get(k, 0.0))
                     if abs(v) > tol:
@@ -1814,7 +1920,7 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
                 'temporal_smooth','imp_budget_loss','imp_geom_loss','exist_budget_loss',
                 'flow_reproj_loss','residual_mag','residual_smooth'
             ]
-            print(_fmt_metrics("Train", train_metrics, train_keys))
+            print(_fmt_metrics("Train", train_metrics, None))
 
             if val_loader is not None:
                 val_metrics = validate(
@@ -1827,7 +1933,7 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
                     'photo_loss','ssim_loss','alpha_sparsity','silhouette_loss','chamfer_loss',
                     'motion_reg','temporal_smooth'
                 ]
-                print(_fmt_metrics("Val", val_metrics, val_keys))
+                print(_fmt_metrics("Val", val_metrics, None))
             else:
                 val_metrics = {'loss': float('inf')}
 
@@ -1880,7 +1986,20 @@ def main():
     config = load_config(args.config)
     import shutil
     shutil.copy2(args.config, os.path.join(args.output_dir, 'config.yaml'))
-
+    # Backup key source files for this run
+    try:
+        backup_dir = os.path.join(args.output_dir, 'code')
+        os.makedirs(backup_dir, exist_ok=True)
+        to_backup = [
+            ('FF4DGSMotion/models/FF4DGSMotion.py', 'FF4DGSMotion.py'),
+            ('step2_train_4DGSFFMotion.py', 'step2_train_4DGSFFMotion.py'),
+            ('configs/ff4dgsmotion.yaml', 'ff4dgsmotion.yaml'),
+        ]
+        for src, name in to_backup:
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(backup_dir, name))
+    except Exception as e:
+        print(f"[Backup] Skipped code backup due to error: {e}")
     # DDP device selection from CLI/env
     train_cfg = config.get("training", {})
     if args.ddp_port is not None:
@@ -1911,8 +2030,6 @@ def main():
     # single process
     _train_worker(0, 1, config, args, args.output_dir, cuda_devices)
     return
-
-    # Dataset and loaders
     sequence_length = config.get('training', {}).get('sequence_length', config.get('training', {}).get('num_frames', 2))
     window_size = sequence_length
     dataset = VoxelFF4DGSDataset(

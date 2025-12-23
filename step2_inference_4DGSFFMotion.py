@@ -629,15 +629,19 @@ def inference(
                     ))
 
                 bg_color = torch.ones(3, device=device)
+                scaling_modifier = float(config.get('render', {}).get('scaling_modifier', 1.0))
 
                 def _render_set(mu_frame, scale_frame, rot_frame, color_frame, alpha_frame):
                     if mu_frame.numel() == 0:
                         Vn = camera_poses_t.shape[0]
                         return torch.zeros(Vn, H_t, W_t, 3, device=device, dtype=mu_frame.dtype)
                     # scale 由网络输出：仅做限幅，避免渲染数值不稳定
-                    scale_frame = scale_frame.to(dtype=mu_frame.dtype).clamp(min=1e-6, max=0.01)
+                    # 与训练保持一致：仅防止数值为 0，不再硬性截断上限
+                    scale_frame = scale_frame.to(dtype=mu_frame.dtype).clamp(min=1e-6)
+                                        # 训练阶段 alpha 已经是 sigmoid 输出，推理保持一致即可
                     opacity = alpha_frame if alpha_frame.dim() == 2 else alpha_frame.unsqueeze(-1)
-                    opacity = opacity.to(dtype=mu_frame.dtype).clamp(0.0, 1.0)
+                    # 若仍担心异常，可在调试中打开以下 clamp
+                    # opacity = opacity.clamp(0.0, 1.0)
                     num_gs = mu_frame.shape[0]
                     if rot_frame is None:
                         rotation = torch.zeros(num_gs, 4, device=mu_frame.device, dtype=mu_frame.dtype)
@@ -649,7 +653,7 @@ def inference(
                     gs_attrs = GaussianAttributes(xyz=mu_frame, opacity=opacity, scaling=scale_frame, rotation=rotation, sh=sh)
                     imgs = []
                     for cam in cams:
-                        res_v = render_gs(camera=cam, bg_color=bg_color, gs=gs_attrs, target_image=None, sh_degree=0, scaling_modifier=1.0)
+                        res_v = render_gs(camera=cam, bg_color=bg_color, gs=gs_attrs, target_image=None, sh_degree=0, scaling_modifier=scaling_modifier)
                         imgs.append(res_v["color"])  # [3,H,W]
                     imgs_t_stacked = torch.stack(imgs, dim=0)  # [V,3,H,W]
                     return imgs_t_stacked.permute(0, 2, 3, 1).contiguous()  # [V,H,W,3]
@@ -840,10 +844,10 @@ def main():
     parser.add_argument('--save_gaussians', action='store_false', default=True, help='Save Gaussian parameters')
     parser.add_argument('--split', type=str, default='all', choices=['all', 'train', 'val'], help='Which split to use for inference')
     parser.add_argument('--use_fast_forward_init', action='store_true', default=True, help='Use fast_forward for color self-correction during inference')
-    parser.add_argument('--preset_aabb_from_points', action='store_true', default=True, help='Estimate tight AABB from points_3d once and preset to model before forward')
+    parser.add_argument('--preset_aabb_from_points', action='store_true', default=False, help='Estimate tight AABB from points_3d once and preset to model before forward (disabled by default to match training)')
     parser.add_argument('--decoder_xyz_space', type=str, default=None, choices=['grid','world'], help='Override decoder xyz space mapping (legacy flag)')
     parser.add_argument('--decoder_xyz_mode', type=str, default=None, choices=['grid_abs','grid_offset','world_abs','world_offset'], help='Override decoder xyz mapping mode')
-    parser.add_argument('--require_preset_aabb', action='store_true', default=True, help='Require preset AABB and error if missing')
+    parser.add_argument('--require_preset_aabb', action='store_true', default=False, help='Require preset AABB and error if missing')
     args = parser.parse_args()
 
     if not os.path.exists(args.config):

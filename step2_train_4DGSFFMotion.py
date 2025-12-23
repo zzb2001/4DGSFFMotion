@@ -38,9 +38,16 @@ from FF4DGSMotion.models.FF4DGSMotion import Trellis4DGS4DCanonical
 from FF4DGSMotion.losses.photo_loss import PhotoConsistencyLoss
 # from fused_ssim import fused_ssim
 import torch.nn.functional as F
+try:
+    from lpips import LPIPS  # perceptual loss
+except ImportError:
+    LPIPS = None
 from FF4DGSMotion.camera.camera import IntrinsicsCamera
 from FF4DGSMotion.diff_renderer.gaussian import render_gs, GaussianAttributes
 from FF4DGSMotion.models._utils import matrix_to_quaternion, rgb2sh0
+LPIPS_MODEL = None
+
+
 def _save_grid_6x4(x: torch.Tensor, name: str):
     """Save 6x4 grid (6 cols × 4 rows) single-channel debug image.
     Args:
@@ -450,6 +457,7 @@ def train_epoch(
     optimizer: optim.Optimizer,
     scaler: GradScaler,
     photo_loss_fn: PhotoConsistencyLoss,
+    lpips_fn: Optional[nn.Module],
     device: torch.device,
     config: dict,
     writer: Optional[SummaryWriter],
@@ -462,6 +470,8 @@ def train_epoch(
     sum_photo = 0.0
     sum_ssim = 0.0
     sum_psnr = 0.0
+    sum_lpips = 0.0
+
     sum_sil = 0.0
     sum_alpha = 0.0
     sum_chamfer = 0.0
@@ -479,6 +489,7 @@ def train_epoch(
     sum_imp_entropy = 0.0
     sum_imp_repel = 0.0
     sum_kp2d = 0.0
+    sum_eval = 0.0
     # stage indicator for pretty printing
     current_stage = None
     n_batches = 0
@@ -652,12 +663,14 @@ def train_epoch(
         photo_loss_acc = torch.tensor(0.0, device=device)
         ssim_loss_acc = torch.tensor(0.0, device=device)
         psnr_acc = torch.tensor(0.0, device=device)
+        lpips_loss_acc = torch.tensor(0.0, device=device)
         n_render = 0
 
         # 颜色初始化：第 1 个 epoch（epoch==0）使用 target_image 估计每个 Gaussian 的 DC 颜色（参考 test_render.py）
         # 注意：这里“写进模型”的方式是把它作为 epoch0 的监督信号，让 gaussian_head 学到合适的初始颜色；
         #      之后颜色仍由网络输出并参与更新（不会在后续 epoch 被固定覆盖）。
-        do_color_init = bool(config.get('training', {}).get('color_init_first_epoch', True)) and (epoch == 0)
+        # 默认禁用颜色初始化以避免 CUDA 错误，如需启用请在配置中设置 color_init_first_epoch: true
+        do_color_init = bool(config.get('training', {}).get('color_init_first_epoch', False)) and (epoch == 0)
         debug_color_init = bool(config.get('training', {}).get('debug_color_init', False))
         # 颜色初始化策略：不是监督，而是“初始化引导渲染”，并逐步退火到网络自身输出
         # blend(t) 从 color_init_blend_start 线性衰减到 color_init_blend_end（按 step 计算）
@@ -679,6 +692,20 @@ def train_epoch(
             target_images_t,  # [V,3,H,W]
         ):
             if target_images_t is None or mu_frame.numel() == 0:
+                return None, None
+            
+            # # 安全检查：如果 Gaussian 数量过多或参数异常，跳过颜色初始化
+            # num_gs = int(mu_frame.shape[0])
+            # if num_gs > 50000:  # 超过 5 万个 Gaussian 时跳过
+            #     print(f"[color_init] Too many Gaussians ({num_gs}), skipping color init")
+            #     return None, None
+            
+            # 检查是否有异常值
+            if torch.isnan(mu_frame).any() or torch.isinf(mu_frame).any():
+                print(f"[color_init] NaN/Inf detected in mu_frame, skipping color init")
+                return None, None
+            if torch.isnan(scale_frame).any() or torch.isinf(scale_frame).any():
+                print(f"[color_init] NaN/Inf detected in scale_frame, skipping color init")
                 return None, None
 
             bg_color = torch.ones(3, device=device)
@@ -769,20 +796,28 @@ def train_epoch(
                     sh=sh_in,
                 )
 
-                res_v = render_gs(
-                    camera=cam,
-                    bg_color=bg_color,
-                    gs=gs_attrs,
-                    # 注意：本项目的 render_gs 期望单张图像 [3,H,W]（非 batch），否则可能触发 CUDA kernel 非法访问
-                    target_image=torch.nan_to_num(
-                        target_images_t[vi].to(device=mu_frame.device, dtype=mu_frame.dtype),
-                        nan=0.0, posinf=0.0, neginf=0.0,
-                    ).clamp(0.0, 1.0).contiguous(),
-                    sh_degree=0,
-                    scaling_modifier=1.0,
-                )
-                if mu_frame.is_cuda and (color_init_sync_cuda or debug_color_init):
-                    torch.cuda.synchronize(device=mu_frame.device)
+                try:
+                    res_v = render_gs(
+                        camera=cam,
+                        bg_color=bg_color,
+                        gs=gs_attrs,
+                        # 注意：本项目的 render_gs 期望单张图像 [3,H,W]（非 batch），否则可能触发 CUDA kernel 非法访问
+                        target_image=torch.nan_to_num(
+                            target_images_t[vi].to(device=mu_frame.device, dtype=mu_frame.dtype),
+                            nan=0.0, posinf=0.0, neginf=0.0,
+                        ).clamp(0.0, 1.0).contiguous(),
+                        sh_degree=0,
+                        scaling_modifier=1.0,
+                    )
+                    if mu_frame.is_cuda and (color_init_sync_cuda or debug_color_init):
+                        torch.cuda.synchronize(device=mu_frame.device)
+                except RuntimeError as e:
+                    if "CUDA" in str(e) or "illegal memory" in str(e):
+                        # CUDA 错误：跳过颜色初始化，使用网络预测颜色
+                        print(f"[color_init] CUDA error in render_gs (view {vi}), skipping color init: {e}")
+                        return None, None
+                    else:
+                        raise
                 est_c = res_v.get("est_color", None)
                 est_w = res_v.get("est_weight", None)
                 if est_c is None or est_w is None:
@@ -935,6 +970,11 @@ def train_epoch(
                             gt_chw.unsqueeze(0).clamp(0, 1),
                             window_size=11,
                         ))
+                    # LPIPS 计算（批内）
+                    if lpips_fn is not None:
+                        pred_nchw = pred_chw.unsqueeze(0) * 2 - 1  # [1,3,H,W] 归一化到 [-1,1]
+                        gt_nchw = gt_chw.unsqueeze(0) * 2 - 1      # [1,3,H,W] 归一化到 [-1,1]
+                        lpips_loss_acc = lpips_loss_acc + lpips_fn(pred_nchw, gt_nchw).mean()
                     mse = torch.mean((pred_chw - gt_chw) ** 2).clamp_min(1e-8)
                     psnr_acc = psnr_acc + (10.0 * torch.log10(1.0 / mse))
                     if t < viz_T and vi < viz_V:
@@ -975,6 +1015,7 @@ def train_epoch(
         lw = {k: _sched(k, float(v)) for k,v in lw_raw.items()}
         w_photo = float(lw.get('photo_l1', 1.0))
         w_ssim = float(lw.get('ssim', 0.0))
+        w_lpips = float(lw.get('lpips', 0.0))
         w_sil = float(lw.get('silhouette', 0.0))
         w_alpha = float(lw.get('alpha_l1', 0.0))
         w_chamfer = float(lw.get('chamfer', 0.0))
@@ -993,57 +1034,72 @@ def train_epoch(
         w_imp_repel = float(lw.get("imp_repel", 0.0))
 
         # Hard stage gating (clear and explicit)
+        # 重写三个阶段的损失权重（不依赖 YAML），一目了然
         if stage == 1:
-            w_motion = 0.0
-            lambda_smooth = 0.0
+            # ========== Stage 1: 静态重建 ==========
+            w_photo = 1.0
+            w_ssim = 0.5
+            w_lpips = 0.2
+            w_sil = 0.5
+            w_alpha = 1e-4
+            
+            # 不使用的损失
             w_chamfer = 0.0
             w_kp2d = 0.0
-
-            w_alpha = 1e-4
-
-            # importance 建议先全关（避免引入额外不确定性）
+            w_motion = 0.0
+            w_temp_vel = 0.0
+            w_temp_acc = 0.0
+            lambda_smooth = 0.0
+            w_res_mag = 0.0
+            w_res_smooth = 0.0
+            
+            # importance / mask 相关（保持关闭）
             w_imp_budget = 0.0
             w_imp_entropy = 0.0
             w_imp_repel = 0.0
-
-            w_res_mag = 0.0
-            w_res_smooth = 0.0
-
             w_dyn = w_sta = w_cross = 0.0
         elif stage == 2:
-            # 关键：开启 3D 几何监督（可 warm-up）
-            progress = (epoch - stage1_epochs) / max(1, stage2_epochs)
-            w_chamfer = 0# 0.1 * min(1.0, max(0.0, progress))
-
-            # motion_reg 不再是“惩罚位移”，而应是“惩罚抖动”
-            # 若你 motion_reg 仍是 ||dxyz||^2，那就让它很小，甚至先为 0
-            w_motion = 0.01  # 如果 motion_reg 还是位移幅值惩罚，建议 stage2 先为 0
-
-            # temporal 用于防抖（必须乘 lambda）
-            lambda_smooth = 0.05  # 比你原来的 0.1 更稳
-
-            # kp2d 作为辅助（不要过大）
-            w_kp2d = 0.3  # 起步，后续可升到 0.1~0.2
-
-            w_alpha = 0.0  # stage2 通常不再压 alpha（避免妨碍运动）
+            # ========== Stage 2: 学习运动 ==========
+            w_photo = 0.5
+            w_ssim = 0.25
+            w_lpips = 0.0  # Stage 2 不使用 LPIPS
+            w_sil = 0.0
+            w_alpha = 0.0
+            
+            # 运动相关损失
+            w_kp2d = 0.5
+            w_motion = 1.0
+            w_temp_vel = 0.1
+            w_temp_acc = 0.1
+            lambda_smooth = 0.0  # 不使用 temporal_smooth（已有 vel/acc）
+            
+            # 不使用的损失
+            w_chamfer = 0.0
+            w_res_mag = 0.0
+            w_res_smooth = 0.0
             w_imp_budget = w_imp_entropy = w_imp_repel = 0.0
-            w_res_mag = w_res_smooth = 0.0
             w_dyn = w_sta = w_cross = 0.0
         else:  # stage 3
-            w_chamfer = 0   # 通常比 stage2 更小，防止牺牲外观
-            lambda_smooth = 0.05
-
-            # 若 stage3 有 residual head，这里才开 residual 正则
-            w_res_mag = 0.1
-            w_res_smooth = 0.05
-
-            # kp2d 可略增强（帮助轨迹稳定）
-            w_kp2d = 0.3
-
-            # motion_reg 如果仍是位移惩罚，保持很小；如果已换成 vel/acc，可设 0.05
-            w_motion = 0.0  # 或 0.05（取决于实现）
-
+            # ========== Stage 3: 精细化运动 ==========
+            w_photo = 0.5
+            w_ssim = 0.25
+            w_lpips = 0.0  # Stage 3 不使用 LPIPS
+            w_sil = 0.0
             w_alpha = 0.0
+            
+            # 运动相关损失
+            w_kp2d = 0.3
+            w_motion = 1.0
+            w_temp_vel = 0.0  # Stage 3 不使用 temporal vel/acc
+            w_temp_acc = 0.0
+            lambda_smooth = 0.0
+            
+            # residual 正则
+            w_res_mag = 0.02
+            w_res_smooth = 0.01
+            
+            # 不使用的损失
+            w_chamfer = 0.0
             w_imp_budget = w_imp_entropy = w_imp_repel = 0.0
             w_dyn = w_sta = w_cross = 0.0
 
@@ -1062,6 +1118,12 @@ def train_epoch(
             ssim_loss = ssim_loss_acc / float(n_render)
         else:
             ssim_loss = torch.tensor(0.0, device=device)
+
+        # LPIPS loss
+        if lpips_fn is not None and gt_images is not None and n_render > 0:
+            lpips_loss = lpips_loss_acc / float(n_render)
+        else:
+            lpips_loss = torch.tensor(0.0, device=device)
 
         psnr_val = (psnr_acc / float(n_render)).detach() if (gt_images is not None and n_render > 0) else torch.tensor(0.0, device=device)
 
@@ -1300,14 +1362,14 @@ def train_epoch(
 
         # ===== quick diagnostics (only first batch per epoch) =====
         if batch_idx == 0:
-            print(_fmt_nonzero('[Diag]', {
-                'photo': w_photo, 'ssim': w_ssim, 'alpha': w_alpha, 'sil': w_sil,
-                'motion': w_motion, 'vel': w_temp_vel, 'acc': w_temp_acc,
-                'chamf': w_chamfer, 'impB': w_imp_budget, 'impH': w_imp_entropy,
-                'resMag': w_res_mag, 'resSm': w_res_smooth}))
+            print(_fmt_nonzero(f'[Diag Stage{stage}]', {
+                'photo': w_photo, 'ssim': w_ssim, 'lpips': w_lpips, 'sil': w_sil, 'alpha': w_alpha,
+                'kp2d': w_kp2d, 'motion': w_motion, 'vel': w_temp_vel, 'acc': w_temp_acc,
+                'chamf': w_chamfer, 'resMag': w_res_mag, 'resSm': w_res_smooth}))
         # ===== compose final loss with explicit term variables =====
         term_photo = w_photo * photo_loss
         term_ssim  = w_ssim * ssim_loss
+        term_lp = w_lpips * lpips_loss
         term_alpha = w_alpha * alpha_sparse
         term_sil   = w_sil * sil_loss
         term_cham  = w_chamfer * chamfer_loss
@@ -1319,18 +1381,21 @@ def train_epoch(
         term_kp2d = w_kp2d * kp2d_loss
         term_temp = lambda_smooth * temporal_smooth
         loss = (
-            term_photo + term_ssim + term_sil + term_alpha +
+            term_photo + term_ssim + term_lp + term_sil + term_alpha +
             term_cham + term_motion + term_temp + term_kp2d +
             term_imp_budget + term_imp_entropy + term_res_mag + term_res_smooth +
             w_dyn * mask_dyn_loss + w_sta * mask_sta_loss + w_cross * mask_cross_loss
         )
 
+        # 累积 eval_loss（photo+ssim+chamfer，用于日志对齐）
+        eval_loss_batch = (w_photo * photo_loss + w_ssim * ssim_loss + w_chamfer * chamfer_loss)
+        sum_eval += float(eval_loss_batch.item())
+
         if batch_idx == 0 and epoch % 1 == 0:
-            print(_fmt_nonzero('[TermContrib]', {
-                        'photo': term_photo, 'ssim': term_ssim, 'motion': term_motion,
-                        'vel': term_temp_vel, 'acc': term_temp_acc, 'chamfer': term_cham,
-                        'impB': term_imp_budget, 'impH': term_imp_entropy,
-                        'resMag': term_res_mag, 'resSm': term_res_smooth}))
+            print(_fmt_nonzero(f'[TermContrib Stage{stage}]', {
+                        'photo': term_photo, 'ssim': term_ssim, 'lpips': term_lp, 'sil': term_sil,
+                        'kp2d': term_kp2d, 'motion': term_motion, 'vel': term_temp_vel, 'acc': term_temp_acc,
+                        'chamfer': term_cham, 'resMag': term_res_mag, 'resSm': term_res_smooth}))
         #【TODO】将rendered_images 和 gt_images [4, 4, 3, 378, 504]绘制在一张大图上，大图两行每行 16 张图
         # rendered_images_concat = torch.cat([rendered_images, gt_images], dim=0).view(32, 3, 378, 504)
         # save_image(rendered_images_concat, 'debug/images/rendered_gt_images.png')
@@ -1343,6 +1408,7 @@ def train_epoch(
         total_loss += loss.item()
         sum_photo += float(photo_loss.item())
         sum_ssim += float(ssim_loss.item())
+        sum_lpips += float(lpips_loss.item())
         sum_psnr += float(psnr_val.item())
         sum_sil += float(sil_loss.item())
         sum_alpha += float(alpha_sparse.item())
@@ -1379,6 +1445,7 @@ def train_epoch(
             writer.add_scalar('Loss/Total', total_loss / denom, global_step)
             writer.add_scalar('Loss/Photo', sum_photo / denom, global_step)
             writer.add_scalar('Loss/SSIM', sum_ssim / denom, global_step)
+            writer.add_scalar('Loss/LPIPS', sum_lpips / denom, global_step)
             writer.add_scalar('Metric/PSNR', sum_psnr / denom, global_step)
             writer.add_scalar('Loss/Silhouette', sum_sil / denom, global_step)
             writer.add_scalar('Loss/AlphaSparse', sum_alpha / denom, global_step)
@@ -1498,9 +1565,11 @@ def train_epoch(
 
     denom = max(1, n_batches)
     metrics: dict[str, float | int] = {
-        'loss': total_loss / denom,
+        'loss_total': total_loss / denom,
+        'loss_eval': sum_eval / denom,
         'photo_loss': sum_photo / denom,
         'ssim_loss': sum_ssim / denom,
+        'lpips_loss': sum_lpips / denom,
         'psnr': sum_psnr / denom,
         'silhouette_loss': sum_sil / denom,
         'alpha_sparsity': sum_alpha / denom,
@@ -1525,6 +1594,7 @@ def validate(
     model: nn.Module,
     dataloader: DataLoader,
     photo_loss_fn: PhotoConsistencyLoss,
+    lpips_fn: Optional[nn.Module],
     device: torch.device,
     config: dict,
     writer: Optional[SummaryWriter],
@@ -1535,6 +1605,7 @@ def validate(
     total_loss = 0.0
     sum_photo = 0.0
     sum_ssim = 0.0
+    sum_lpips = 0.0
     sum_sil = 0.0
     sum_alpha = 0.0
     sum_chamfer = 0.0
@@ -1569,6 +1640,7 @@ def validate(
             H_t, W_t = config['data']['image_size']
             photo_loss_acc = torch.tensor(0.0, device=device)
             ssim_loss_acc = torch.tensor(0.0, device=device)
+            lpips_loss_acc = torch.tensor(0.0, device=device)
             n_render = 0
 
             dyn_mask_in = dyn_mask_tv if dyn_mask_tv is not None else silhouette
@@ -1667,6 +1739,11 @@ def validate(
                                 gt_chw.unsqueeze(0).clamp(0, 1),
                                 window_size=11,
                             ))
+                        # LPIPS 计算（验证时仅统计）
+                        if lpips_fn is not None:
+                            pred_nchw = pred_chw.unsqueeze(0) * 2 - 1  # [1,3,H,W] 归一化到 [-1,1]
+                            gt_nchw = gt_chw.unsqueeze(0) * 2 - 1      # [1,3,H,W] 归一化到 [-1,1]
+                            lpips_loss_acc = lpips_loss_acc + lpips_fn(pred_nchw, gt_nchw).mean()
                     n_render += 1
                     del pred_chw
 
@@ -1688,6 +1765,12 @@ def validate(
                 ssim_loss = ssim_loss_acc / float(n_render)
             else:
                 ssim_loss = torch.tensor(0.0, device=device)
+
+            # LPIPS loss (validation)
+            if lpips_fn is not None and gt_images is not None and n_render > 0:
+                lpips_loss = lpips_loss_acc / float(n_render)
+            else:
+                lpips_loss = torch.tensor(0.0, device=device)
 
             # Silhouette (disabled - no rendered_alpha available)
             sil_loss = torch.tensor(0.0, device=device)
@@ -1739,16 +1822,13 @@ def validate(
             loss = (
                 w_photo * photo_loss +
                 w_ssim * ssim_loss +
-                w_sil * sil_loss +
-                w_alpha * alpha_sparse +
-                w_chamfer * chamfer_loss +
-                w_motion * motion_reg +
-                lambda_smooth * temporal_smooth
+                w_chamfer * chamfer_loss
             )
 
             total_loss += loss.item()
             sum_photo += float(photo_loss.item())
             sum_ssim += float(ssim_loss.item())
+            sum_lpips += float(lpips_loss.item())
             sum_sil += float(sil_loss.item())
             sum_alpha += float(alpha_sparse.item())
             sum_chamfer += float(chamfer_loss.item())
@@ -1762,9 +1842,11 @@ def validate(
 
     denom = max(1, n_batches)
     return {
-        'loss': total_loss / denom,
+        'loss': total_loss / denom,  # 修改为 'loss' 以便 _fmt_metrics 正确显示
+        'loss_eval': total_loss / denom,
         'photo_loss': sum_photo / denom,
         'ssim_loss': sum_ssim / denom,
+        'lpips_loss': sum_lpips / denom,
         'silhouette_loss': sum_sil / denom,
         'alpha_sparsity': sum_alpha / denom,
         'chamfer_loss': sum_chamfer / denom,
@@ -1866,11 +1948,23 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
         device = torch.device("cuda", local_rank)
     else:
         device = torch.device("cpu")
-
+    
     rank = int(local_rank)
     port = int(config.get("training", {}).get("ddp_port", 29500))
     _ddp_setup(rank=rank, world_size=world_size, port=port)
     is_rank0 = (rank == 0)
+    
+    # Initialize LPIPS model once (rank0 only)
+    lpips_fn = None
+    if LPIPS is not None and is_rank0:
+        try:
+            lpips_fn = LPIPS(net='vgg').to(device).eval()
+            for p in lpips_fn.parameters():
+                p.requires_grad_(False)
+            print("[LPIPS] Initialized VGG LPIPS model (rank0)")
+        except Exception as e:
+            lpips_fn = None
+            print(f"[LPIPS] Not available ({e}); LPIPS loss disabled")
 
     # TensorBoard (rank0 only)
     writer = None
@@ -2033,7 +2127,7 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
         train_metrics = train_epoch(
             model.module if world_size > 1 else model,
             train_loader, optimizer, scaler,
-            photo_loss_fn, device, config, writer, ep,
+            photo_loss_fn, lpips_fn, device, config, writer, ep,
             ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
             output_dir=output_dir,
         )
@@ -2041,24 +2135,34 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
         # Only rank0 runs validation + saves checkpoints
         if is_rank0:
             train_keys = [
-                'photo_loss','ssim_loss','alpha_sparsity','chamfer_loss','motion_reg',
+                'photo_loss','ssim_loss','lpips_loss','alpha_sparsity','chamfer_loss','motion_reg',
                 'temporal_smooth','imp_budget_loss','imp_geom_loss','exist_budget_loss',
                 'flow_reproj_loss','residual_mag','residual_smooth'
             ]
-            print(_fmt_metrics("Train", train_metrics, None))
+            # 打印训练指标（只显示总损失和主要子损失）
+            train_display = {
+                'loss': train_metrics['loss_total'],
+                'stage': train_metrics.get('stage', 1),
+                'photo_loss': train_metrics['photo_loss'],
+                'ssim_loss': train_metrics['ssim_loss'],
+                'lpips_loss': train_metrics['lpips_loss'],
+                'alpha_sparsity': train_metrics['alpha_sparsity'],
+                'kp2d_loss': train_metrics.get('kp2d_loss', 0.0),
+                'motion_reg': train_metrics.get('motion_reg', 0.0),
+                'psnr': train_metrics.get('psnr', 0.0),
+            }
+            print(_fmt_metrics("Train", train_display, ['photo_loss','ssim_loss','lpips_loss','alpha_sparsity','kp2d_loss','motion_reg','psnr']))
 
             if val_loader is not None:
                 val_metrics = validate(
                     model.module if world_size > 1 else model,
                     val_loader,
-                    photo_loss_fn, device, config, writer, ep,
+                    photo_loss_fn, lpips_fn, device, config, writer, ep,
                     ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
                 )
-                val_keys = [
-                    'photo_loss','ssim_loss','alpha_sparsity','silhouette_loss','chamfer_loss',
-                    'motion_reg','temporal_smooth'
-                ]
-                print(_fmt_metrics("Val", val_metrics, None))
+                # 只打印验证集的主要指标（与训练格式一致）
+                val_display_keys = ['photo_loss','ssim_loss','lpips_loss','alpha_sparsity']
+                print(_fmt_metrics("Val", val_metrics, val_display_keys))
             else:
                 val_metrics = {'loss': float('inf')}
 

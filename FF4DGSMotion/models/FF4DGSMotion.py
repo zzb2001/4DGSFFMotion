@@ -968,7 +968,7 @@ class Trellis4DGS4DCanonical(nn.Module):
         min_vs = float(getattr(self.cfg, "imp_min_voxel_size", 1e-4))
         M_target = float(getattr(self.cfg, "imp_target_points", 100000))
         voxel_size = max(min_vs, voxel_ratio * (scene_diag / (max(1.0, M_target) ** 0.5)))
-
+        voxel_size=0.015
         thin_idx = _thin_by_voxel_keep_max(flat_xyz_all, p, voxel_size=voxel_size)  # [N_thin]
         xyz_0 = flat_xyz_all[thin_idx]  # [N_thin,3]
         M = int(xyz_0.shape[0])

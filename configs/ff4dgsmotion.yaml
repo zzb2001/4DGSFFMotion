@@ -56,7 +56,7 @@ model:
   # 当 fine_num_points 很大（例如 100k）时，避免 MHA/SDPA 触发 CUDA invalid configuration
   point_agg_chunk: 25000
 training:
-  num_epochs: 1000
+  num_epochs: 500
   num_frames: 6
   sequence_length: 6
   num_workers: 0
@@ -95,8 +95,8 @@ training:
 
   # 三阶段训练调度（按 epoch）
   stages:
-    stage1_epochs: 500
-    stage2_epochs: 600
+    stage1_epochs: 50
+    stage2_epochs: 100
   # Stage3 residual loss（仅当 model.use_residual_motion=true 且输出 dxyz_t_res 时生效）
   stage3_residual_mag: 0.5
   stage3_residual_smooth: 0.1

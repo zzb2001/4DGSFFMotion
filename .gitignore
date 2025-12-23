@@ -13,3 +13,4 @@ results/
 preproc/checkpoints
 preproc/checkpoints/
 data/
+*.ply

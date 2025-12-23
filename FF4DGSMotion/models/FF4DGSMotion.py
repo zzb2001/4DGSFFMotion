@@ -73,6 +73,35 @@ def _soft_assign_topk(
     return idx_out, w_out
 
 
+def save_ply_xyz(xyz: torch.Tensor, filename: str):
+    """Save a set of 3-D points to a PLY file using Open3D.
+
+    Args:
+        xyz: Tensor [N,3] in world units.
+        filename: Output path (will create directory if needed).
+    """
+    import os
+    try:
+        import open3d as o3d  # type: ignore
+    except ImportError as e:
+        raise ImportError("open3d is required for save_ply_xyz but is not installed") from e
+
+    if not torch.is_tensor(xyz):
+        raise TypeError(f"xyz must be a torch.Tensor, got {type(xyz)}")
+    if xyz.dim() != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
+
+    xyz_np = xyz.detach().cpu().to(torch.float32).numpy()
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz_np)
+
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    if not filename.lower().endswith('.ply'):
+        filename = filename + '.ply'
+    o3d.io.write_point_cloud(filename, pcd)
+
+
 def _thin_by_voxel_keep_max(
     xyz: torch.Tensor,      # [N,3]
     score: torch.Tensor,    # [N]
@@ -323,8 +352,11 @@ class AnchorDeltaHead(nn.Module):
             nn.SiLU(),
             nn.Linear(self.hidden_dim, self.out_dim),
         )
+        # maximum displacement magnitude (world units)
+        self.max_disp = 0.5
         if isinstance(self.out_mlp[-1], nn.Linear):
-            nn.init.zeros_(self.out_mlp[-1].weight)
+            # Larger init std to provide meaningful initial motion signal
+            nn.init.normal_(self.out_mlp[-1].weight, mean=0.0, std=1e-1)
             if self.out_mlp[-1].bias is not None:
                 nn.init.zeros_(self.out_mlp[-1].bias)
 
@@ -356,6 +388,8 @@ class AnchorDeltaHead(nn.Module):
         z_h = self.z_proj(z)         # [M,H]
         fused = gate.unsqueeze(1) * z_h.unsqueeze(0)  # [T,M,H]
         out = self.out_mlp(fused.reshape(T * M, -1)).view(T, M, self.out_dim)
+        # Limit displacement range using tanh * max_disp
+        out = torch.tanh(out) * float(self.max_disp)
         return out
 
 
@@ -570,6 +604,9 @@ class ModelCfg:
     use_rot_refine: bool = False
     motion_dim: int = 128
 
+    # Motion gate control: default off to let network move freely early training
+    enable_motion_gate: bool = False
+
     num_anchors_static: int = 4096
     num_anchors_dynamic: int = 4096
     slot_iters: int = 3
@@ -665,6 +702,12 @@ class Trellis4DGS4DCanonical(nn.Module):
             use_scale_refine=bool(self.cfg.use_scale_refine),
             use_rot_refine=bool(self.cfg.use_rot_refine),
         )
+
+        # Motion scale parameter (for amplitude warmup)
+        # 全局可学习 motion_scale，用于调节 dxyz_f 的幅度（支持 warm-up）
+        motion_scale_init = float(getattr(self.cfg, "motion_scale_init", 0.3))
+        # 作为可学习参数（而非 buffer）
+        self.motion_scale = nn.Parameter(torch.tensor(motion_scale_init, dtype=torch.float32))
 
         # Step 6（可选）：dyn_pred_token（学习动静）
         if bool(self.cfg.use_dyn_pred_token):
@@ -854,6 +897,16 @@ class Trellis4DGS4DCanonical(nn.Module):
         Ms = int(mu_s0.shape[0])
         Md = int(mu_d0.shape[0])
 
+        # Compute scene scale (diagonal) to adapt motion limits
+        xyz_min_scene = token_xyz.squeeze(0).amin(dim=0)
+        xyz_max_scene = token_xyz.squeeze(0).amax(dim=0)
+        scene_diag = torch.norm((xyz_max_scene - xyz_min_scene).clamp(min=1e-9)).item()
+        # Adapt max displacement based on scene scale
+        if hasattr(self.dynamic_anchor_motion, "max_disp"):
+            self.dynamic_anchor_motion.max_disp = float(0.05 * scene_diag)
+        if self.residual_motion_head is not None and hasattr(self.residual_motion_head, "max_disp"):
+            self.residual_motion_head.max_disp = float(0.02 * scene_diag)
+
         # Step 3: Dynamic Anchor Motion Head（Δxyz_d(t)）
         if Md > 0:
             dxyz_anchor_d = self.dynamic_anchor_motion(feat_d, time_ids)  # [T,Md,3]
@@ -978,10 +1031,17 @@ class Trellis4DGS4DCanonical(nn.Module):
         # C2: soft existence with budget normalization
         exist_raw = torch.sigmoid(imp_logits)  # [M]
         M_target = float(getattr(self.cfg, "imp_target_points", 100000))
-        eps = 1e-6
-        sum_exist = exist_raw.sum() + eps
-        scale = M_target / sum_exist
-        exist_w = torch.clamp(exist_raw * scale, 0.0, 1.0)  # [M]
+        # Prevent instability from exploding scale factor
+        # 1. Clamp sum_exist to a minimum value to ensure the denominator is not too small.
+        #    A reasonable minimum is a fraction of the target, e.g., 1%.
+        # Increase base existence in early training to boost gradients
+        min_sum_exist = M_target * 0.20
+        sum_exist = exist_raw.sum().clamp(min=min_sum_exist)
+
+        # 2. Also clamp the scale factor itself to prevent it from becoming excessively large.
+        scale = (M_target / sum_exist).clamp(max=20.0)  # Cap the amplification factor
+
+        exist_w = (exist_raw * scale).clamp(0.0, 1.0)  # [M]
         exist_w1 = exist_w.view(-1, 1)
 
         # ============================================================
@@ -1002,25 +1062,28 @@ class Trellis4DGS4DCanonical(nn.Module):
             w_d = torch.zeros(M, 0, device=device, dtype=dtype)
             dxyz_f = torch.zeros(T, M, 3, device=device, dtype=dtype)
 
-        # gate motion by existence and dynamic probability
+        # gate_motion 仅依赖动态概率 p_dyn_f，并设置下限防止 early zero
         if dyn_flat is not None:
             p_dyn_f = dyn_flat[thin_idx].view(-1, 1).clamp(0.0, 1.0)  # [M,1]
         else:
             p_dyn_f = torch.full((M, 1), 0.5, device=device, dtype=dtype)
-        gate_w = (exist_w1 * p_dyn_f).clamp(0.0, 1.0)
-        dxyz_f = dxyz_f * gate_w.view(1, M, 1)
+        gate_motion = (0.2 + 0.8 * p_dyn_f).clamp(0.0, 1.0)  # soft gate with lower bound 0.2
+
+        # 只在 alpha/opacity 分支使用 exist_w1
+        dxyz_f = self.motion_scale * dxyz_f * gate_motion.view(1, M, 1)
 
         # Step 7: residual motion（可选）
         if self.residual_motion_head is not None:
             z_f = self.point_aggregator(
                 xyz_0,
-                feat_red[0:1],             # use t=0 features for residual input; ok
-                camera_poses[0:1],
-                camera_intrinsics[0:1],
-                time_ids[0:1],
+                feat_red.mean(dim=0, keepdim=True),  # 使用所有时间平均的观察，增强表达力
+                camera_poses,
+                camera_intrinsics,
+                time_ids,
             )  # [M,C]
             dxyz_res = self.residual_motion_head(z_f, time_ids)  # [T,M,3]
-            dxyz_f = dxyz_f + gate_w.view(1, M, 1) * dxyz_res
+            # residual 分支同样使用 gate_motion（不依赖 exist_w1）
+            dxyz_f = dxyz_f + gate_motion.view(1, M, 1) * dxyz_res
         else:
             dxyz_res = None
 
@@ -1063,74 +1126,7 @@ class Trellis4DGS4DCanonical(nn.Module):
             "imp_logits": imp_logits,
         }
 
-def _thin_by_voxel_keep_max(
-    xyz: torch.Tensor,      # [N,3]
-    score: torch.Tensor,    # [N] in [0,1] or any non-negative weights
-    voxel_size: float,
-    eps_tie: float = 1e-6,
-) -> torch.Tensor:
-    """
-    Density-aware thinning without reconstruction:
-    - compute voxel index = floor(xyz / voxel_size)
-    - hash voxel index to 1D
-    - keep the point with max(score) per voxel (tie-broken by tiny noise)
-    returns:
-        keep_idx: [M] indices into xyz (M <= N)
-    """
-    if xyz.numel() == 0:
-        return torch.zeros(0, device=xyz.device, dtype=torch.long)
-    if xyz.dim() != 2 or xyz.shape[1] != 3:
-        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
-    if score.dim() != 1 or score.shape[0] != xyz.shape[0]:
-        raise ValueError(f"score must be [N], got {tuple(score.shape)} vs N={xyz.shape[0]}")
 
-    N = int(xyz.shape[0])
-    device = xyz.device
-
-    vs = float(max(1e-9, voxel_size))
-    # Use xyz_min to avoid huge indices if xyz is large
-    xyz_min = xyz.amin(dim=0, keepdim=True)
-    vidx = torch.floor((xyz - xyz_min) / vs).to(torch.int64)  # [N,3]
-
-    # hash 3D voxel index to 1D (using large primes, works for int64)
-    hx = vidx[:, 0] * 73856093
-    hy = vidx[:, 1] * 19349663
-    hz = vidx[:, 2] * 83492791
-    h = (hx ^ hy ^ hz)  # [N] int64
-
-    # map to compact voxel ids
-    uniq_h, inv = torch.unique(h, return_inverse=True)  # inv: [N] in [0,num_vox)
-    num_vox = int(uniq_h.shape[0])
-
-    # break ties deterministically-ish
-    # (important: if multiple points share same max score in a voxel, keep exactly one)
-    score2 = score + eps_tie * torch.rand_like(score)
-
-    # PyTorch>=2.0: scatter_reduce_ supports amax
-    max_per_vox = torch.full((num_vox,), -1e30, device=device, dtype=score2.dtype)
-    max_per_vox.scatter_reduce_(0, inv, score2, reduce="amax", include_self=True)
-
-    keep_mask = score2 >= (max_per_vox[inv] - 1e-12)
-    keep_idx = torch.nonzero(keep_mask, as_tuple=False).view(-1)  # may still have >1 in rare cases
-
-    # If still duplicates due to numerical issues, enforce one per voxel by sorting and unique.
-    if keep_idx.numel() > num_vox:
-        h_keep = h[keep_idx]
-        s_keep = score2[keep_idx]
-        # sort by (h, -s) to take best per voxel
-        order = torch.argsort(h_keep)  # group by h first
-        keep_idx = keep_idx[order]
-        h_keep = h_keep[order]
-        s_keep = s_keep[order]
-
-        # within each voxel group, keep first occurrence with maximal s (already close)
-        # do a stable pass: mark new voxel starts
-        new_vox = torch.ones_like(h_keep, dtype=torch.bool)
-        new_vox[1:] = h_keep[1:] != h_keep[:-1]
-        # keep first in each voxel group
-        keep_idx = keep_idx[new_vox]
-
-    return keep_idx
 
 
 if __name__ == "__main__":

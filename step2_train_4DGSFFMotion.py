@@ -36,7 +36,7 @@ from FF4DGSMotion.data.dataset import VoxelFF4DGSDataset
 from FF4DGSMotion.models.FF4DGSMotion import Trellis4DGS4DCanonical
 
 from FF4DGSMotion.losses.photo_loss import PhotoConsistencyLoss
-from fused_ssim import fused_ssim
+# from fused_ssim import fused_ssim
 import torch.nn.functional as F
 from FF4DGSMotion.camera.camera import IntrinsicsCamera
 from FF4DGSMotion.diff_renderer.gaussian import render_gs, GaussianAttributes
@@ -62,6 +62,37 @@ def _save_grid_6x4(x: torch.Tensor, name: str):
         save_image(x_cpu, f"debug/images/{name}.png", nrow=6, normalize=True)
     except Exception as e:
         print(f"[debug] failed to save {name}: {e}")
+# pretty print non-zero train metrics
+def _fmt_metrics(title: str, m: dict, keys: list[str] | None = None, tol: float = 1e-8) -> str:
+    """Pretty-print metrics.
+    If *keys* is None, print every key in *m* (except 'loss'/'stage').
+    Only values with absolute magnitude larger than *tol* are shown.
+    Additionally, the current *stage* (if present in *m*) will be
+    appended to *title* so the caller doesn’t have to manually
+    include it.
+    """
+    stage = m.get('stage', None)
+    if stage is not None:
+        title = f"{title}(Stage {int(stage)})"
+    parts = [f"{title}: {m.get('loss', 0.0):.4f}"]
+    if keys is None:
+        keys = [k for k in m.keys() if k not in ('loss', 'stage')]
+    for k in keys:
+        v = float(m.get(k, 0.0))
+        if abs(v) > tol:
+            pretty = k.replace('_', ' ').title()
+            parts.append(f"{pretty}: {v:.4f}")
+    return " | ".join(parts)
+# ---------- pretty-print helpers ----------
+
+def _fmt_nonzero(prefix: str, kv: dict[str, float], tol: float = 1e-8) -> str:
+    parts = [prefix]
+    for k, v in kv.items():
+        if abs(float(v)) > tol:
+            parts.append(f"{k}:{v:.4g}")
+    return " | ".join(parts)
+
+
 def _gaussian(window_size: int, sigma: float, device: torch.device, dtype: torch.dtype):
     gauss = torch.Tensor([math.exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)]).to(device=device, dtype=dtype)
     return gauss/gauss.sum()
@@ -172,7 +203,19 @@ def load_gt_images_from_ex4dgs(time_idx: int, ex4dgs_dir: str, image_size: Tuple
         return None
     return torch.from_numpy(np.stack(gt_images, axis=0))
 
-
+# ---------- motion_scale warm-up & dynamic loss weights ----------
+def _update_motion_scale(model, gstep: int, config: dict):
+    """Linearly warm-up model.motion_scale (now Parameter)."""
+    warm_cfg = config.get('training', {}).get('motion_scale_warmup', {})
+    warmup = int(warm_cfg.get('steps', 2000))
+    start = float(warm_cfg.get('start', 0.1))  # 与模型初始保持一致
+    end = float(warm_cfg.get('end', 1.0))
+    alpha = min(1.0, gstep / max(1, warmup))
+    cur = start + alpha * (end - start)
+    tgt = model.module if hasattr(model, 'module') else model
+    if hasattr(tgt, 'motion_scale') and torch.is_tensor(tgt.motion_scale):
+        with torch.no_grad():
+            tgt.motion_scale.data.fill_(float(cur))
 def prepare_batch(
     batch: dict,
     device: torch.device,
@@ -435,6 +478,7 @@ def train_epoch(
     sum_res_smooth = 0.0
     sum_imp_entropy = 0.0
     sum_imp_repel = 0.0
+    sum_kp2d = 0.0
     # stage indicator for pretty printing
     current_stage = None
     n_batches = 0
@@ -455,7 +499,7 @@ def train_epoch(
     # stage 3: epoch >= stage1_epochs + stage2_epochs
     if epoch < stage1_epochs:
         stage = 1
-    elif epoch < stage1_epochs + stage2_epochs:
+    elif epoch < stage2_epochs:
         stage = 2
     else:
         stage = 3
@@ -502,6 +546,10 @@ def train_epoch(
         _set_requires_grad(getattr(model, "gaussian_head", None), True)
     # Stage 2：解冻 anchor motion，恢复其它模块训练；仍冻结 residual
     elif stage == 2:
+        # Stage 2: 推动“学运动”——启用 dxyz vel/acc temporal 正则，关闭 lambda_smooth
+        w_temp_vel = 0.1
+        w_temp_acc = 0.1
+        lambda_smooth = 0.0
         _set_requires_grad(getattr(model, "dynamic_anchor_motion", None), True)
         _set_requires_grad(getattr(model, "residual_motion_head", None), False)
         _set_requires_grad(getattr(model, "feat_reduce", None), True)
@@ -525,13 +573,18 @@ def train_epoch(
         _set_requires_grad(getattr(model, "imp_view_emb", None), True)
         _set_requires_grad(getattr(model, "gaussian_head", None), True)
 
+
+        
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training")):
+        global_step = epoch * len(dataloader) + batch_idx
+        # 更新可学习 motion_scale（线性 warm-up）
+        _update_motion_scale(model, global_step, config)
+
         batch_data = prepare_batch(
-            batch, device,
-            ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
-            image_size=tuple(config['data']['image_size']),
-            config=config, mode='train'
-        )
+        batch, device,
+        ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
+        image_size=tuple(config['data']['image_size']),
+        config=config, mode='train')
         points = batch_data.get('points', None)
 
         # --- 检验函数 debug save of batch inputs (first batch only) ---
@@ -552,7 +605,7 @@ def train_epoch(
         conf_seq = batch_data['conf']
         dyn_mask_tv = batch_data.get('dynamic_conf_tv', None)
         dyn_traj_tv = batch_data.get('dynamic_traj_tv', None)
-        keypoints_2d = batch_data.get('keypoints_2d', None)
+        keypoints_2d = batch_data.get('keypoints_2d', None) #[6, 4, 176, 2]
         silhouette = batch_data.get('silhouette', None)
         camera_poses_seq = batch_data['camera_poses']
         camera_intrinsics_seq = batch_data['camera_intrinsics']
@@ -913,16 +966,24 @@ def train_epoch(
 
 
         # Loss weights
-        lw = config.get('loss_weights', {})
+        lw_raw = config.get('loss_weights', {})
+        # schedule weights by epoch
+        def _sched(name: str, base: float):
+            stage_cfg = config.get('schedule', {})
+            after = int(stage_cfg.get(f"{name}_after", 0))
+            return 0.0 if epoch < after else base
+        lw = {k: _sched(k, float(v)) for k,v in lw_raw.items()}
         w_photo = float(lw.get('photo_l1', 1.0))
         w_ssim = float(lw.get('ssim', 0.0))
         w_sil = float(lw.get('silhouette', 0.0))
         w_alpha = float(lw.get('alpha_l1', 0.0))
         w_chamfer = float(lw.get('chamfer', 0.0))
         w_motion = float(lw.get('motion_reg', 0.0))
+        w_kp2d = 0.0  # default, will override per stage
         w_temp_vel = float(lw.get('temporal_vel', 0.0))
         w_temp_acc = float(lw.get('temporal_acc', 0.0))
         w_cycle = float(lw.get('cycle_consistency', 0.0))
+
         w_dyn = float(lw.get('mask_dyn', 0.0))
         w_sta = float(lw.get('mask_sta', 0.0))
         w_cross = float(lw.get('mask_cross', 0.0))
@@ -933,44 +994,59 @@ def train_epoch(
 
         # Hard stage gating (clear and explicit)
         if stage == 1:
-            # 开启：photo、(可选)ssim、弱 alpha、importance 三项
-            # 关闭：motion / temporal / chamfer / 所有 mask
             w_motion = 0.0
             lambda_smooth = 0.0
             w_chamfer = 0.0
-            w_dyn = 0.0
-            w_sta = 0.0
-            w_cross = 0.0
-            # importance 稳定器（Stage1 仅小权重）
-            w_alpha=0
-            w_imp_budget = 0
-            w_imp_entropy = 0.0
-            w_imp_repel = 0.0
-            # 对齐损失强化
-            w_imp_geom = 0.0
-            w_flow_reproj = 0.0
-        elif stage == 2:
-            # 开启：photo、motion、temporal；importance 仅保留很小预算；Chm=0.05；alignment 继续保留但减弱
-            w_imp_budget = 0.05
-            w_imp_entropy = 0.0
-            w_imp_repel = 0.0
-            w_motion = 1.0
-            lambda_smooth = 0.1
-            w_chamfer = 0.0
-            w_dyn = 0.0
-            w_sta = 0.0
-            w_cross = 0.0
-        else:  # stage 3
-            # 开启：photo、motion、residual 正则、极小 chamfer；关闭所有 importance 正则
+            w_kp2d = 0.0
+
+            w_alpha = 1e-4
+
+            # importance 建议先全关（避免引入额外不确定性）
             w_imp_budget = 0.0
             w_imp_entropy = 0.0
             w_imp_repel = 0.0
-            w_motion = 1.0
-            lambda_smooth = 0.1
-            w_chamfer = 0.01
-            w_dyn = 0.0
-            w_sta = 0.0
-            w_cross = 0.0
+
+            w_res_mag = 0.0
+            w_res_smooth = 0.0
+
+            w_dyn = w_sta = w_cross = 0.0
+        elif stage == 2:
+            # 关键：开启 3D 几何监督（可 warm-up）
+            progress = (epoch - stage1_epochs) / max(1, stage2_epochs)
+            w_chamfer = 0# 0.1 * min(1.0, max(0.0, progress))
+
+            # motion_reg 不再是“惩罚位移”，而应是“惩罚抖动”
+            # 若你 motion_reg 仍是 ||dxyz||^2，那就让它很小，甚至先为 0
+            w_motion = 0.01  # 如果 motion_reg 还是位移幅值惩罚，建议 stage2 先为 0
+
+            # temporal 用于防抖（必须乘 lambda）
+            lambda_smooth = 0.05  # 比你原来的 0.1 更稳
+
+            # kp2d 作为辅助（不要过大）
+            w_kp2d = 0.3  # 起步，后续可升到 0.1~0.2
+
+            w_alpha = 0.0  # stage2 通常不再压 alpha（避免妨碍运动）
+            w_imp_budget = w_imp_entropy = w_imp_repel = 0.0
+            w_res_mag = w_res_smooth = 0.0
+            w_dyn = w_sta = w_cross = 0.0
+        else:  # stage 3
+            w_chamfer = 0   # 通常比 stage2 更小，防止牺牲外观
+            lambda_smooth = 0.05
+
+            # 若 stage3 有 residual head，这里才开 residual 正则
+            w_res_mag = 0.1
+            w_res_smooth = 0.05
+
+            # kp2d 可略增强（帮助轨迹稳定）
+            w_kp2d = 0.3
+
+            # motion_reg 如果仍是位移惩罚，保持很小；如果已换成 vel/acc，可设 0.05
+            w_motion = 0.0  # 或 0.05（取决于实现）
+
+            w_alpha = 0.0
+            w_imp_budget = w_imp_entropy = w_imp_repel = 0.0
+            w_dyn = w_sta = w_cross = 0.0
+
 
         if gt_images is not None and n_render > 0:
             photo_loss = photo_loss_acc / float(n_render)
@@ -1053,18 +1129,14 @@ def train_epoch(
         alpha_sparse = torch.abs(alpha_t).mean() if w_alpha > 0 else torch.tensor(0.0, device=device)
 
         # Motion regularization using SegAnyMo dynamic confidence (lower conf -> stronger penalty)
-
-        color_init_loss = torch.tensor(0.0, device=device)
         motion_reg = torch.tensor(0.0, device=device)
-        if w_motion > 0 and dxyz_t is not None:
-            dyn_conf = batch_data.get('dynamic_conf', None)  # [T,H,W]
-            if dyn_conf is not None:
-                w_t = 1.0 - dyn_conf.mean(dim=(1,2))  # [T]
-                # per-frame mean L2 of displacements
-                per_t = (dxyz_t.pow(2).sum(dim=2).mean(dim=1))  # [T]
-                motion_reg = (w_t * per_t).mean()
-            else:
-                motion_reg = (dxyz_t.pow(2).sum(dim=2).mean())
+        if w_motion > 0 and dxyz_t is not None and dxyz_t.shape[0] >= 3:
+            # velocity & acceleration smoothness (L1)
+            vel = (dxyz_t[1:] - dxyz_t[:-1]).abs().mean(dim=2)   # [T-1,M]
+            acc = (dxyz_t[2:] - 2*dxyz_t[1:-1] + dxyz_t[:-2]).abs().mean(dim=2)  # [T-2,M]
+            vel_loss = vel.mean()
+            acc_loss = acc.mean()
+            motion_reg = 0.5 * vel_loss + 0.5 * acc_loss    #一阶二阶平滑
 
         # Stage 3: residual motion regularization (stronger than anchor motion)
         w_res_mag = float(stage_cfg.get("stage3_residual_mag", 0.0)) if stage == 3 else 0.0
@@ -1080,79 +1152,134 @@ def train_epoch(
                 res_smooth = torch.abs(dxyz_t_res[1:] - dxyz_t_res[:-1]).mean()
 
         # Simple/Weighted Chamfer (per frame, using points_3d transformed by Sim3)
-        chamfer_loss = torch.tensor(0.0, device=device)
-        if w_chamfer > 0 and sim3_s is not None and points_3d is not None and points_3d.numel() > 0:
-            ch_cfg = config.get('loss_params', {}).get('chamfer', {})
-            weighted = bool(ch_cfg.get('weighted', True))
-            use_alpha = bool(ch_cfg.get('use_alpha', True))
-            use_vis = bool(ch_cfg.get('use_visibility', True))
-            max_m = int(ch_cfg.get('max_pairs', 4096))
-            eps = 1e-8
-            vis_map = batch_data.get('visibility', None)  # [T,H,W]
-            for t in range(T):
-                mu = mu_t[t]  # [M,3]
-                pts = points_3d[t]  # [N,3] with N=H*W
-                if pts.numel() == 0:
-                    continue
-                # Transform points by Sim3
-                s_t = sim3_s[t]
-                R_t = sim3_R[t]
-                t_t = sim3_t[t]
-                pts_can = s_t * (pts @ R_t.T) + t_t  # [N,3]
-                # subsample
-                m_idx = torch.randperm(mu.shape[0], device=device)[:min(mu.shape[0], max_m)]
-                n_idx = torch.randperm(pts_can.shape[0], device=device)[:min(pts_can.shape[0], max_m)]
-                mu_s = mu[m_idx]
-                pts_s = pts_can[n_idx]
-                dists = torch.cdist(mu_s, pts_s, p=2)
-                # weights
-                if weighted:
-                    # mu weights from alpha
-                    if use_alpha:
-                        w_mu = alpha_t[t].squeeze(-1)[m_idx].clamp(min=0.0)
-                    else:
-                        w_mu = torch.ones_like(m_idx, dtype=dtype, device=device)
-                    # pts weights from visibility
-                    if use_vis and vis_map is not None:
-                        H = vis_map.shape[1]
-                        W = vis_map.shape[2]
-                        w_pts_full = vis_map[t].reshape(-1)  # [N]
-                        w_pts = w_pts_full[n_idx].clamp(min=0.0)
-                    else:
-                        w_pts = torch.ones_like(n_idx, dtype=dtype, device=device)
-                    # mu->pts
-                    min_mu = dists.min(dim=1).values
-                    chamfer_mu = (w_mu * min_mu).sum() / (w_mu.sum() + eps)
-                    # pts->mu
-                    min_pts = dists.min(dim=0).values
-                    chamfer_pts = (w_pts * min_pts).sum() / (w_pts.sum() + eps)
-                    chamfer_t = chamfer_mu + chamfer_pts
-                else:
-                    chamfer_t = dists.min(dim=1).values.mean() + dists.min(dim=0).values.mean()
-                chamfer_loss = chamfer_loss + chamfer_t
-            chamfer_loss = chamfer_loss / max(T,1)
+        # --------------------------------------------------------
+        # Displacement Chamfer Loss (Stage2 / Stage3)
+        # Chamfer( mu_t - mu_0 , X_t - X_0 )
+        # --------------------------------------------------------
 
-        temporal_smooth = torch.tensor(0.0, device=device)
-        if lambda_smooth > 0 and T >= 3:
-            # simple 2nd-order smoothness on positions
-            x_prev = mu_t[:-2]
-            x_curr = mu_t[1:-1]
-            x_next = mu_t[2:]
-            temporal_smooth = ((x_next - 2 * x_curr + x_prev) ** 2).mean()
+        chamfer_loss = torch.tensor(0.0, device=device)
+
+        if w_chamfer > 0 and points_3d is not None and points_3d.numel() > 0:
+            K_ds = config.get('loss_params', {}).get('chamfer', {}).get('max_pairs', 2048)
+            eps = 1e-8
+
+            mu_0 = mu_t[0].detach()        # [M,3]  canonical (stop grad)
+            pts_0 = points_3d[0].detach() # [N,3]
+
+            loss_acc = torch.tensor(0.0, device=device)
+            valid_t = 0
+
+            for t in range(1, T):
+                mu = mu_t[t]              # [M,3]
+                pts = points_3d[t]        # [N,3]
+
+                if mu.numel() == 0 or pts.numel() == 0:
+                    continue
+
+                # displacement
+                d_mu  = mu  - mu_0        # [M,3]
+                d_pts = pts - pts_0       # [N,3]
+
+                # subsample
+                m_idx = torch.randperm(d_mu.shape[0], device=device)[:min(d_mu.shape[0], K_ds)]
+                n_idx = torch.randperm(d_pts.shape[0], device=device)[:min(d_pts.shape[0], K_ds)]
+
+                d_mu_s  = d_mu[m_idx]
+                d_pts_s = d_pts[n_idx]
+
+                # chamfer
+                dists = torch.cdist(d_mu_s, d_pts_s, p=2)
+                chamfer_t = (
+                    dists.min(dim=1).values.mean() +
+                    dists.min(dim=0).values.mean()
+                )
+
+                loss_acc = loss_acc + chamfer_t
+                valid_t += 1
+
+            if valid_t > 0:
+                chamfer_loss = loss_acc / valid_t
+
+
+        # ------------- Keypoint 2D reprojection loss -------------
+        kp2d_loss = torch.tensor(0.0, device=device)
+        if w_kp2d > 0 and keypoints_2d is not None and keypoints_2d.numel() > 0:
+            # keypoints_2d: [T,V,K,2] in pixel (x,y)
+            K_mat = camera_intrinsics_seq  # [T,V,3,3]
+            C2W = camera_poses_seq        # [T,V,4,4]
+            T_kp, V_kp, Kk = keypoints_2d.shape[0], keypoints_2d.shape[1], keypoints_2d.shape[2]
+            # soft association temperature
+            tau = 4.0
+            kp_err_acc = 0.0
+            cnt = 0
+            for t in range(min(T, T_kp)):
+                mu = mu_t[t]  # [M,3]
+                if mu.numel() == 0:
+                    continue
+                M_t = mu.shape[0]
+                for v in range(V_kp):
+                    kp_pix = keypoints_2d[t, v]  # [K,2]
+                    Kk_t = kp_pix.shape[0]
+                    if Kk_t == 0:
+                        continue
+                    # 投影 mu -> [M,2]
+                    c2w = C2W[t, v]  # [4,4]
+                    w2c = torch.inverse(c2w)
+                    xyz_h = torch.cat([mu, torch.ones(M_t,1, device=mu.device,dtype=mu.dtype)], dim=1)  # [M,4]
+                    Xc = (w2c @ xyz_h.t()).t()[:, :3]          # [M,3]
+                    z = Xc[:, 2].clamp(min=1e-4)               # 深度
+                    uvw = (K_mat[t, v] @ Xc.t()).t()           # [M,3]
+                    u = uvw[:, 0] / uvw[:, 2]
+                    vv = uvw[:, 1] / uvw[:, 2]
+                    proj = torch.stack([u, vv], dim=-1)        # [M,2]
+                    # 有效可见 mask (z>0 且在图内)
+                    H_img, W_img = H_t, W_t
+                    vis_mask = (z > 1e-4) & (proj[:,0]>=0) & (proj[:,0]<W_img) & (proj[:,1]>=0) & (proj[:,1]<H_img)
+                    if vis_mask.sum() == 0:
+                        continue
+                    proj_vis = proj[vis_mask]                # [Mv,2]
+                    # 取每个 kp 与所有 proj_vis 的距离 softmin → 估计误差
+                    d2 = torch.cdist(kp_pix.to(device=proj_vis.device,dtype=proj_vis.dtype), proj_vis, p=2)  # [K,Mv]
+                    w = torch.softmax(-d2 / tau, dim=1)       # soft assoc
+                    pred_uv = (w.unsqueeze(-1) * proj_vis.unsqueeze(0)).sum(dim=1)  # [K,2]
+                    err = (pred_uv - kp_pix.to(dtype=pred_uv.dtype,device=pred_uv.device)).abs().mean()
+                    kp_err_acc = kp_err_acc + err
+                    cnt += 1
+            if cnt > 0:
+                kp2d_loss = kp_err_acc / float(cnt)
+        # ---------------- Temporal regularizers -----------------
+        vel_loss = torch.tensor(0.0, device=device)
+        acc_loss = torch.tensor(0.0, device=device)
+        if dxyz_t is not None and T >= 2:
+            vel_loss = (dxyz_t[1:] - dxyz_t[:-1]).pow(2).mean()
+        if dxyz_t is not None and T >= 3:
+            acc_loss = (dxyz_t[2:] - 2 * dxyz_t[1:-1] + dxyz_t[:-2]).pow(2).mean()
+        term_temp_vel = w_temp_vel * vel_loss
+        term_temp_acc = w_temp_acc * acc_loss
+        temporal_smooth = term_temp_vel + term_temp_acc  # for logging only
 
         # ----- Stage C regularization (budget/entropy + repulsion) -----
+        # Initialize entropy placeholders for clarity even if selector disabled
+        imp_entropy = torch.tensor(0.0, device=device)
+        imp_entropy_reg = torch.tensor(0.0, device=device)
         imp_budget_loss = torch.tensor(0.0, device=device)
 
         imp_logits = output.get("imp_logits", None)
         if imp_logits is not None and (w_imp_budget > 0.0 or w_imp_entropy > 0.0):
-            imp_probs = torch.sigmoid(imp_logits)
+            imp_probs_raw = torch.sigmoid(imp_logits)
+            # avoid exact 0/1 which lead to log(0)=nan
+            eps_p = 1e-6
+            imp_probs = imp_probs_raw.clamp(min=eps_p, max=1.0 - eps_p)
+            # replace any NaN / Inf that may come from nan logits
+            imp_probs = torch.nan_to_num(imp_probs, nan=0.5, posinf=1.0 - eps_p, neginf=eps_p)
             # 让 probs 的均值接近预算比例，避免 logits 全饱和（硬选 k 固定，主要是 stabilizer）
             target = float(mu_t.shape[1]) / float(max(1, imp_probs.numel()))
             imp_budget_loss = (imp_probs.mean() - target) ** 2
             # 最大化熵：loss = -H(p)
-            eps = 1e-8
-            ent = -(imp_probs * torch.log(imp_probs + eps) + (1.0 - imp_probs) * torch.log(1.0 - imp_probs + eps))
-            imp_entropy_loss = -ent.mean()
+            ent = -(imp_probs * torch.log(imp_probs) + (1.0 - imp_probs) * torch.log(1.0 - imp_probs))
+            imp_entropy = torch.nan_to_num(ent, nan=0.0).mean()  # ensure finite
+            # Regularization term: maximize entropy by minimizing its negative (or set target)
+            imp_entropy_reg = -imp_entropy
 
         xyz_f0 = output.get("xyz_f0", None)
         if xyz_f0 is not None and w_imp_repel > 0.0:
@@ -1171,22 +1298,39 @@ def train_epoch(
                 sigma2 = float(max(1e-8, rp_sigma * rp_sigma))
                 imp_repel_loss = torch.exp(-knn_d2 / sigma2).mean().to(device=device, dtype=mu_t.dtype)
 
+        # ===== quick diagnostics (only first batch per epoch) =====
+        if batch_idx == 0:
+            print(_fmt_nonzero('[Diag]', {
+                'photo': w_photo, 'ssim': w_ssim, 'alpha': w_alpha, 'sil': w_sil,
+                'motion': w_motion, 'vel': w_temp_vel, 'acc': w_temp_acc,
+                'chamf': w_chamfer, 'impB': w_imp_budget, 'impH': w_imp_entropy,
+                'resMag': w_res_mag, 'resSm': w_res_smooth}))
+        # ===== compose final loss with explicit term variables =====
+        term_photo = w_photo * photo_loss
+        term_ssim  = w_ssim * ssim_loss
+        term_alpha = w_alpha * alpha_sparse
+        term_sil   = w_sil * sil_loss
+        term_cham  = w_chamfer * chamfer_loss
+        term_motion = w_motion * motion_reg
+        term_imp_budget = w_imp_budget * imp_budget_loss
+        term_imp_entropy = w_imp_entropy * imp_entropy_reg
+        term_res_mag = w_res_mag * res_mag
+        term_res_smooth = w_res_smooth * res_smooth
+        term_kp2d = w_kp2d * kp2d_loss
+        term_temp = lambda_smooth * temporal_smooth
         loss = (
-            w_photo * photo_loss +
-            w_ssim * ssim_loss +
-            w_sil * sil_loss +
-            w_alpha * alpha_sparse +
-            w_chamfer * chamfer_loss +
-            w_motion * motion_reg +
-            lambda_smooth * temporal_smooth
-            + w_dyn * mask_dyn_loss
-            + w_sta * mask_sta_loss
-            + w_cross * mask_cross_loss
-            + w_res_mag * res_mag
-            + w_res_smooth * res_smooth
-            + w_imp_budget * imp_budget_loss
-
+            term_photo + term_ssim + term_sil + term_alpha +
+            term_cham + term_motion + term_temp + term_kp2d +
+            term_imp_budget + term_imp_entropy + term_res_mag + term_res_smooth +
+            w_dyn * mask_dyn_loss + w_sta * mask_sta_loss + w_cross * mask_cross_loss
         )
+
+        if batch_idx == 0 and epoch % 1 == 0:
+            print(_fmt_nonzero('[TermContrib]', {
+                        'photo': term_photo, 'ssim': term_ssim, 'motion': term_motion,
+                        'vel': term_temp_vel, 'acc': term_temp_acc, 'chamfer': term_cham,
+                        'impB': term_imp_budget, 'impH': term_imp_entropy,
+                        'resMag': term_res_mag, 'resSm': term_res_smooth}))
         #【TODO】将rendered_images 和 gt_images [4, 4, 3, 378, 504]绘制在一张大图上，大图两行每行 16 张图
         # rendered_images_concat = torch.cat([rendered_images, gt_images], dim=0).view(32, 3, 378, 504)
         # save_image(rendered_images_concat, 'debug/images/rendered_gt_images.png')
@@ -1212,8 +1356,9 @@ def train_epoch(
         sum_mask_cross += float(mask_cross_loss.item())
         sum_res_mag += float(res_mag.item())
         sum_res_smooth += float(res_smooth.item())
-        sum_imp_entropy += float(imp_entropy_loss.item() if 'imp_entropy_loss' in locals() else 0.0)
+        sum_imp_entropy += float(imp_entropy.item() if 'imp_entropy' in locals() else 0.0)
         sum_imp_repel += float(imp_repel_loss.item() if 'imp_repel_loss' in locals() else 0.0)
+        sum_kp2d += float(kp2d_loss.item())
 
         n_batches += 1
 
@@ -1368,8 +1513,9 @@ def train_epoch(
         'mask_cross_loss': sum_mask_cross / denom,
         'residual_mag': sum_res_mag / denom,
         'residual_smooth': sum_res_smooth / denom,
-        'imp_entropy_loss': sum_imp_entropy / denom,
+        'imp_entropy': sum_imp_entropy / denom,
         'imp_repel_loss': sum_imp_repel / denom,
+        'kp2d_loss': sum_kp2d / denom,
         'stage': current_stage,
     }
     return metrics
@@ -1894,27 +2040,6 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
 
         # Only rank0 runs validation + saves checkpoints
         if is_rank0:
-            # pretty print non-zero train metrics
-            def _fmt_metrics(title: str, m: dict, keys: list[str] | None = None, tol: float = 1e-8) -> str:
-                """Pretty-print metrics.
-                If *keys* is None, print every key in *m* (except 'loss'/'stage').
-                Only values with absolute magnitude larger than *tol* are shown.
-                Additionally, the current *stage* (if present in *m*) will be
-                appended to *title* so the caller doesn’t have to manually
-                include it.
-                """
-                stage = m.get('stage', None)
-                if stage is not None:
-                    title = f"{title}(Stage {int(stage)})"
-                parts = [f"{title}: {m.get('loss', 0.0):.4f}"]
-                if keys is None:
-                    keys = [k for k in m.keys() if k not in ('loss', 'stage')]
-                for k in keys:
-                    v = float(m.get(k, 0.0))
-                    if abs(v) > tol:
-                        pretty = k.replace('_', ' ').title()
-                        parts.append(f"{pretty}: {v:.4f}")
-                return " | ".join(parts)
             train_keys = [
                 'photo_loss','ssim_loss','alpha_sparsity','chamfer_loss','motion_reg',
                 'temporal_smooth','imp_budget_loss','imp_geom_loss','exist_budget_loss',
@@ -2030,166 +2155,7 @@ def main():
     # single process
     _train_worker(0, 1, config, args, args.output_dir, cuda_devices)
     return
-    sequence_length = config.get('training', {}).get('sequence_length', config.get('training', {}).get('num_frames', 2))
-    window_size = sequence_length
-    dataset = VoxelFF4DGSDataset(
-        pi3_results_dir=config['data']['pi3_results_dir'],
-        seganymo_dir=config['data']['seganymo_dir'],
-        reloc3r_dir=config['data']['reloc3r_dir'],
-        image_size=tuple(config['data']['image_size']),
-        use_sim3_normalize=config.get('data', {}).get('use_sim3_normalize', False),
-        window_size=window_size,
-        preload_all=bool(config.get('data', {}).get('preload_all', True)),
-        sample_interval=int(config.get('data', {}).get('sample_interval', 30)),
-        image_dir=config.get('data', {}).get('image_dir', None),
-    )
 
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-
-    # TimeWindowSampler keeps time steps consecutive
-    from FF4DGSMotion.data.dataset import TimeWindowSampler, WindowBatchSampler
-    window_sampler = TimeWindowSampler(train_dataset, window_size=window_size, shuffle=False)
-    batch_sampler = WindowBatchSampler(window_sampler, shuffle=True)
-
-    # 重要：CUDA 环境下用 DataLoader(num_workers>0, 默认 fork) 容易触发 “CUDA initialization error/worker aborted”
-    # 这里在 CUDA 可用且 num_workers>0 时强制使用 spawn 上下文，避免 fork 继承 CUDA 上下文。
-    mp_ctx = "spawn" if (torch.cuda.is_available() and int(config['training']['num_workers']) > 0) else None
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=batch_sampler,
-        num_workers=int(config['training']['num_workers']),
-        multiprocessing_context=mp_ctx,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    # Validation loader
-    sequence_length = config.get('training', {}).get('sequence_length', config.get('training', {}).get('num_frames', 2))
-    T_training = sequence_length
-    val_batch_size = args.batch_size if args.batch_size is not None else T_training
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=val_batch_size,
-        shuffle=False,
-        num_workers=int(config['training']['num_workers']),
-        multiprocessing_context=mp_ctx,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-    # Model: 参数全部来自 configs/ff4dgsmotion.yaml 的 model 字段，结构在 FF4DGSMotion/models/FF4DGSMotion.py 内部构建
-    mc = config.get('model', {})
-    model = Trellis4DGS4DCanonical(cfg=mc).to(device)
-
-    # Apply fine-grained freezing per CLI flags
-    def _set_requires_grad(module: nn.Module, flag: bool):
-        for p in module.parameters():
-            p.requires_grad = flag
-    if args.freeze_flow:
-        # coarse/anchor 分支
-        if hasattr(model, "feat_reduce"):
-            _set_requires_grad(model.feat_reduce, False)
-        if hasattr(model, "dual_slot_prior"):
-            _set_requires_grad(model.dual_slot_prior, False)
-        if hasattr(model, "dyn_pred_token") and (model.dyn_pred_token is not None):
-            _set_requires_grad(model.dyn_pred_token, False)
-        print("[Freeze] feat_reduce / dual_slot_prior / dyn_pred_token frozen")
-    if args.freeze_decoder:
-        # 外观解码分支
-        if hasattr(model, "point_aggregator"):
-            _set_requires_grad(model.point_aggregator, False)
-        if hasattr(model, "gaussian_head"):
-            _set_requires_grad(model.gaussian_head, False)
-        print("[Freeze] point_aggregator and gaussian_head frozen")
-    if args.freeze_motion:
-        # motion 分支
-        if hasattr(model, "dynamic_anchor_motion"):
-            _set_requires_grad(model.dynamic_anchor_motion, False)
-        if hasattr(model, "residual_motion_head") and (model.residual_motion_head is not None):
-            _set_requires_grad(model.residual_motion_head, False)
-        print("[Freeze] dynamic_anchor_motion (+ residual_motion_head) frozen")
-
-    # Loss function
-    # PhotoConsistencyLoss only supports loss_type ('l1' or 'l2')
-    photo_loss_fn = PhotoConsistencyLoss(loss_type='l1')
-
-    # Optimizer
-    lr = float(config['training']['learning_rate'])
-    weight_decay = float(config['training']['weight_decay'])
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
-    # Enable AMP only if model parameters are not in FP16
-    has_fp16_params = any(p.dtype == torch.float16 for p in model.parameters())
-    use_amp = torch.cuda.is_available() and (not has_fp16_params)
-    if has_fp16_params:
-        print('[AMP] Detected FP16 model parameters; disabling GradScaler and autocast to avoid unscale errors.')
-    scaler = GradScaler(enabled=use_amp)
-
-    # Resume
-    start_epoch = 0
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint.get('epoch', 0)
-        else:
-            model.load_state_dict(checkpoint)
-        print(f"Resumed from epoch {start_epoch}")
-
-    num_epochs = config['training']['num_epochs']
-    best_val = float('inf')
-
-    for epoch in range(start_epoch, num_epochs):
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, scaler,
-            photo_loss_fn, device, config, writer, epoch,
-            ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
-            output_dir=args.output_dir,
-        )
-        print(f"Train Loss: {train_metrics['loss']:.4f} | Photo: {train_metrics['photo_loss']:.4f} | SSIM: {train_metrics['ssim_loss']:.4f} | Alpha: {train_metrics['alpha_sparsity']:.4f} | Silhouette: {train_metrics['silhouette_loss']:.4f} | Chamfer: {train_metrics['chamfer_loss']:.4f} | MotionReg: {train_metrics['motion_reg']:.4f} | TemporalSmooth: {train_metrics['temporal_smooth']:.4f}")
-
-        val_metrics = validate(
-            model, val_loader,
-            photo_loss_fn, device, config, writer, epoch,
-            ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
-        )
-        print(f"Val   Loss: {val_metrics['loss']:.4f} | Photo: {val_metrics['photo_loss']:.4f} | SSIM: {val_metrics['ssim_loss']:.4f} | Alpha: {val_metrics['alpha_sparsity']:.4f} | Silhouette: {val_metrics['silhouette_loss']:.4f} | Chamfer: {val_metrics['chamfer_loss']:.4f} | MotionReg: {val_metrics['motion_reg']:.4f} | TemporalSmooth: {val_metrics['temporal_smooth']:.4f}")
-
-        if writer is not None:
-            writer.add_scalar('Epoch/Loss', train_metrics['loss'], epoch)
-            writer.add_scalar('Epoch/PhotoLoss', train_metrics['photo_loss'], epoch)
-            writer.add_scalar('Epoch/SSIMLoss', train_metrics['ssim_loss'], epoch)
-            writer.add_scalar('Epoch/AlphaSparsity', train_metrics['alpha_sparsity'], epoch)
-            writer.add_scalar('Epoch/SilhouetteLoss', train_metrics['silhouette_loss'], epoch)
-            writer.add_scalar('Epoch/ChamferLoss', train_metrics['chamfer_loss'], epoch)
-            writer.add_scalar('Epoch/MotionReg', train_metrics['motion_reg'], epoch)
-            writer.add_scalar('Epoch/TemporalSmooth', train_metrics['temporal_smooth'], epoch)
-            writer.add_scalar('Epoch/ValLoss', val_metrics['loss'], epoch)
-            writer.add_scalar('Epoch/ValPhotoLoss', val_metrics['photo_loss'], epoch)
-            writer.add_scalar('Epoch/ValSSIMLoss', val_metrics['ssim_loss'], epoch)
-            writer.add_scalar('Epoch/ValAlphaSparsity', val_metrics['alpha_sparsity'], epoch)
-            writer.add_scalar('Epoch/ValSilhouetteLoss', val_metrics['silhouette_loss'], epoch)
-            writer.add_scalar('Epoch/ValChamferLoss', val_metrics['chamfer_loss'], epoch)
-            writer.add_scalar('Epoch/ValMotionReg', val_metrics['motion_reg'], epoch)
-            writer.add_scalar('Epoch/ValTemporalSmooth', val_metrics['temporal_smooth'], epoch)
-
-        # Save checkpoints
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_metrics': train_metrics,
-            'val_metrics': val_metrics,
-        }
-        torch.save(checkpoint, os.path.join(args.output_dir, 'latest.pth'))
-        if val_metrics['loss'] < best_val:
-            best_val = val_metrics['loss']
-            torch.save(checkpoint, os.path.join(args.output_dir, 'best.pth'))
-            print(f"Saved best model (val_loss: {best_val:.4f})")
-
-    writer.close()
-    print("Training completed!")
 
 
 if __name__ == '__main__':

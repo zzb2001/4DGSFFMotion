@@ -248,6 +248,10 @@ def prepare_batch(
     feat_2d_batch = batch.get('feat_2d', None)
     if feat_2d_batch is not None:
         feat_2d_batch = feat_2d_batch.to(device, non_blocking=True)  # [B,V,H',W',C]
+        # 2D 特征在 AMP 训练下用 fp16 存储即可（显存减半）；验证默认保持 fp32，避免 dtype/bias 不匹配
+        feat_fp16 = bool(config.get("training", {}).get("feat_2d_fp16", True))
+        if mode == "train" and feat_fp16:
+            feat_2d_batch = feat_2d_batch.to(dtype=torch.float16)
 
     if conf.dim() == 4:
         conf = conf.unsqueeze(-1)
@@ -362,7 +366,8 @@ def prepare_batch(
         camera_intrinsics = K_new.unsqueeze(0).unsqueeze(0).repeat(T, V, 1, 1)
 
     # Global points (average across views)
-    points_3d = points.reshape(T, V, H * W, 3).mean(dim=1) if points is not None else torch.zeros(T, 1, 3, device=device)  # [T,N,3]
+    # points_3d（每帧点云）很占显存且多数训练阶段不需要；改为在需要的 loss 内部按需计算
+    points_3d = None
 
     # 2D features: prefer dataset-provided feat_2d; fallback to zeros
     if feat_2d_batch is not None:
@@ -407,9 +412,10 @@ def prepare_batch(
             break
     if keypoints_2d is not None:
         if isinstance(keypoints_2d, torch.Tensor):
-            keypoints_2d = keypoints_2d.to(device, non_blocking=True).float()
+            # keypoints_2d 仅在 loss 用到，没必要常驻 GPU：保留在 CPU，使用时再搬运
+            keypoints_2d = keypoints_2d.detach().cpu().float()
         else:
-            keypoints_2d = torch.as_tensor(keypoints_2d, device=device).float()
+            keypoints_2d = torch.as_tensor(keypoints_2d).float()
         keypoints_2d = keypoints_2d[:T]
 
     # GT images if available
@@ -464,6 +470,7 @@ def train_epoch(
     epoch: int,
     ex4dgs_dir: Optional[str],
     output_dir: Optional[str],
+    is_rank0: bool = True,
 ) -> dict:
     model.train()
     total_loss = 0.0
@@ -502,18 +509,17 @@ def train_epoch(
     lambda_smooth = float(config.get('loss_weights', {}).get('dynamic_temporal', 0.0))
 
     # ----------------------------
-    # Three-stage training schedule
+    # Two-stage training schedule
     # ----------------------------
     stage_cfg = config.get("training", {}).get("stages", {}) or {}
-    stage1_epochs = int(stage_cfg.get("stage1_epochs", 10))
-    stage2_epochs = int(stage_cfg.get("stage2_epochs", 20))
-    # stage 3: epoch >= stage1_epochs + stage2_epochs
+    stage1_epochs = int(stage_cfg.get("stage1_epochs", 100))
+    # stage 1: epoch < stage1_epochs
+    # stage 2: epoch >= stage1_epochs
     if epoch < stage1_epochs:
         stage = 1
-    elif epoch < stage2_epochs:
-        stage = 2
     else:
-        stage = 3
+        stage = 2
+
     current_stage = stage
     freeze_canonical = True if stage == 1 else False
 
@@ -540,28 +546,9 @@ def train_epoch(
         for p in module.parameters():
             p.requires_grad = enabled
 
-    # Stage 1：只训练 importance / gaussian 分支
+    # Stage 1：训练 Gaussians & importance，冻结 motion / residual
     if stage == 1:
-        # Freeze motion
         _set_requires_grad(getattr(model, "dynamic_anchor_motion", None), False)
-        _set_requires_grad(getattr(model, "residual_motion_head", None), False)
-        # Freeze feature/priors/aggregator/aux
-        _set_requires_grad(getattr(model, "feat_reduce", None), False)
-        _set_requires_grad(getattr(model, "dual_slot_prior", None), False)
-        _set_requires_grad(getattr(model, "point_aggregator", None), False)
-        _set_requires_grad(getattr(model, "dyn_pred_token", None), False)
-        # Enable importance + gaussian
-        _set_requires_grad(getattr(model, "imp_head", None), True)
-        _set_requires_grad(getattr(model, "imp_time_emb", None), True)
-        _set_requires_grad(getattr(model, "imp_view_emb", None), True)
-        _set_requires_grad(getattr(model, "gaussian_head", None), True)
-    # Stage 2：解冻 anchor motion，恢复其它模块训练；仍冻结 residual
-    elif stage == 2:
-        # Stage 2: 推动“学运动”——启用 dxyz vel/acc temporal 正则，关闭 lambda_smooth
-        w_temp_vel = 0.1
-        w_temp_acc = 0.1
-        lambda_smooth = 0.0
-        _set_requires_grad(getattr(model, "dynamic_anchor_motion", None), True)
         _set_requires_grad(getattr(model, "residual_motion_head", None), False)
         _set_requires_grad(getattr(model, "feat_reduce", None), True)
         _set_requires_grad(getattr(model, "dual_slot_prior", None), True)
@@ -571,7 +558,7 @@ def train_epoch(
         _set_requires_grad(getattr(model, "imp_time_emb", None), True)
         _set_requires_grad(getattr(model, "imp_view_emb", None), True)
         _set_requires_grad(getattr(model, "gaussian_head", None), True)
-    # Stage 3：解冻 residual；importance 头降低学习率（0.1x），不冻结
+    # Stage 2：全部解冻
     else:
         _set_requires_grad(getattr(model, "dynamic_anchor_motion", None), True)
         _set_requires_grad(getattr(model, "residual_motion_head", None), True)
@@ -611,7 +598,7 @@ def train_epoch(
         #     _dbg_save(batch_data.get('conf_prob', None), 'conf_prob')
         #     _dbg_save(batch_data.get('silhouette', None), 'silhouette')
         #     _dbg_save(batch_data.get('dynamic_conf_tv', None), 'dynamic_conf_tv')
-        points_3d = batch_data['points_3d']
+        points_3d = batch_data.get('points_3d', None)
         feat_2d = batch_data['feat_2d']
         conf_seq = batch_data['conf']
         dyn_mask_tv = batch_data.get('dynamic_conf_tv', None)
@@ -623,7 +610,7 @@ def train_epoch(
         time_ids = batch_data['time_ids']
         gt_images_raw = batch_data.get('gt_images', None)
         gt_images = gt_images_raw.permute(0, 1, 4, 2, 3).contiguous() if gt_images_raw is not None else None
-        T = points_3d.shape[0]
+        T = int(time_ids.shape[0])
 
         optimizer.zero_grad(set_to_none=True)
         use_amp_ctx = autocast() if scaler.is_enabled() else nullcontext()
@@ -664,6 +651,7 @@ def train_epoch(
         ssim_loss_acc = torch.tensor(0.0, device=device)
         psnr_acc = torch.tensor(0.0, device=device)
         lpips_loss_acc = torch.tensor(0.0, device=device)
+        lpips_count = 0
         n_render = 0
 
         # 颜色初始化：第 1 个 epoch（epoch==0）使用 target_image 估计每个 Gaussian 的 DC 颜色（参考 test_render.py）
@@ -876,79 +864,114 @@ def train_epoch(
                 return sh0_use.to(device=mu_frame.device, dtype=mu_frame.dtype), est_weight_avg.to(device=mu_frame.device, dtype=mu_frame.dtype)
 
         def render_set(mu_frame, scale_frame, rot_frame, color_frame, alpha_frame, camera_poses_t, camera_intrinsics_t, target_images_t=None):
-            bg_color = torch.ones(3, device=device)
-            max_scale = float(config.get('model', {}).get('max_scale', 0.05))
-            # 与 inference 对齐：scale 仅限幅，不做像素半径校准
-            scale_frame = scale_frame.to(dtype=mu_frame.dtype).clamp(min=1e-6, max=max_scale)
+            # 统一策略：模型 forward 用 AMP，但渲染端强制 fp32（避免 autocast 在 render 内反复 promote/cast 造成显存波动）
+            with torch.cuda.amp.autocast(enabled=False):
+                bg_color = torch.ones(3, device=device, dtype=torch.float32)
+                max_scale = float(config.get('model', {}).get('max_scale', 0.05))
+                # 与 inference 对齐：scale 仅限幅，不做像素半径校准
+                scale_frame = scale_frame.to(dtype=mu_frame.dtype).clamp(min=1e-6, max=max_scale)
 
-            init_sh0 = None
-            init_weight = None
-            if do_color_init and (target_images_t is not None):
-                init_sh0, init_weight = estimate_init_sh0_from_targets(
-                    mu_frame=mu_frame,
-                    scale_frame=scale_frame,
-                    rot_frame=rot_frame,
-                    color_frame_pred=color_frame,
-                    alpha_frame=alpha_frame,
-                    camera_poses_t=camera_poses_t,
-                    camera_intrinsics_t=camera_intrinsics_t,
-                    target_images_t=target_images_t,
-                )
+                init_sh0 = None
+                init_weight = None
+                if do_color_init and (target_images_t is not None):
+                    init_sh0, init_weight = estimate_init_sh0_from_targets(
+                        mu_frame=mu_frame,
+                        scale_frame=scale_frame,
+                        rot_frame=rot_frame,
+                        color_frame_pred=color_frame,
+                        alpha_frame=alpha_frame,
+                        camera_poses_t=camera_poses_t,
+                        camera_intrinsics_t=camera_intrinsics_t,
+                        target_images_t=target_images_t,
+                    )
 
-            # 渲染颜色采用“退火混合”：
-            #   sh_render = (1-β)*sh_pred + β*sh_init
-            # 这样 epoch0 初期颜色接近 fast_forward 结果，同时梯度仍回传到网络颜色分支。
-            sh_pred = rgb2sh0(color_frame.to(dtype=mu_frame.dtype).clamp(0.0, 1.0))  # [M,3]
-            if do_color_init and init_sh0 is not None and blend_steps > 0:
-                # 线性退火
-                t = float(min(max(global_step, 0), blend_steps)) / float(blend_steps)
-                beta = (1.0 - t) * blend_start + t * blend_end
-                beta = float(max(0.0, min(1.0, beta)))
-                sh_render = (1.0 - beta) * sh_pred + beta * init_sh0.detach()
-            elif do_color_init and init_sh0 is not None and blend_steps <= 0:
-                sh_render = init_sh0.detach()
-            else:
-                sh_render = sh_pred
-            sh_for_render = sh_render.unsqueeze(1)  # [M,1,3]
-            for vi in range(camera_poses_t.shape[0]):
-                c2w = camera_poses_t[vi].detach().cpu().numpy()
-                w2c = np.linalg.inv(c2w)
-                R = w2c[:3, :3].astype(np.float32)
-                t_vec = w2c[:3, 3].astype(np.float32)
-                K_np = camera_intrinsics_t[vi].detach().cpu().numpy().astype(np.float32)
-                cam = IntrinsicsCamera(
-                    K=K_np, R=R, T=t_vec,
-                    width=int(W_t), height=int(H_t),
-                    znear=0.01, zfar=100.0,
-                )
-                opacity = alpha_frame.squeeze(-1) if alpha_frame.dim() > 1 else alpha_frame
-                opacity = opacity.to(dtype=mu_frame.dtype).clamp(0.0, 1.0)
-                num_gs = mu_frame.shape[0]
-                if rot_frame is None:
-                    rotation = torch.zeros(num_gs, 4, device=mu_frame.device, dtype=mu_frame.dtype)
-                    rotation[:, 0] = 1.0
+                # 渲染颜色采用“退火混合”：
+                #   sh_render = (1-β)*sh_pred + β*sh_init
+                # 这样 epoch0 初期颜色接近 fast_forward 结果，同时梯度仍回传到网络颜色分支。
+                # ---- [ADD] sanitize inputs for rasterizer stability ----
+                mu_frame = torch.nan_to_num(mu_frame, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+                scale_frame = torch.nan_to_num(scale_frame, nan=1e-3, posinf=1e-3, neginf=1e-3).contiguous()
+                alpha_frame = torch.nan_to_num(alpha_frame, nan=0.0, posinf=1.0, neginf=0.0).contiguous()
+                if rot_frame is not None:
+                    rot_frame = torch.nan_to_num(rot_frame, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+
+                # 强烈建议：render 端统一用 float32（很多 CUDA rasterizer 对 fp16 不稳）
+                mu_frame = mu_frame.float()
+                scale_frame = scale_frame.float()
+                alpha_frame = alpha_frame.float()
+
+                safe_color = torch.nan_to_num(color_frame, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+                safe_color = safe_color.to(device=mu_frame.device, dtype=torch.float32).contiguous()
+                sh_pred = rgb2sh0(safe_color).to(dtype=torch.float32).contiguous()  # [M,3]
+
+                if do_color_init and init_sh0 is not None and blend_steps > 0:
+                    # 线性退火
+                    t = float(min(max(global_step, 0), blend_steps)) / float(blend_steps)
+                    beta = (1.0 - t) * blend_start + t * blend_end
+                    beta = float(max(0.0, min(1.0, beta)))
+                    sh_render = (1.0 - beta) * sh_pred + beta * init_sh0.detach()
+                elif do_color_init and init_sh0 is not None and blend_steps <= 0:
+                    sh_render = init_sh0.detach()
                 else:
-                    rotation = matrix_to_quaternion(rot_frame).to(device=mu_frame.device, dtype=mu_frame.dtype)
-                    rotation = rotation / rotation.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-                gs_attrs = GaussianAttributes(
-                    xyz=mu_frame,
-                    opacity=opacity,
-                    scaling=scale_frame,
-                    rotation=rotation,
-                    sh=sh_for_render,
-                )
-                res_v = render_gs(camera=cam, bg_color=bg_color, gs=gs_attrs, target_image=None, sh_degree=0, scaling_modifier=1.0)
-                yield vi, res_v["color"]  # [3,H,W]
-            return
+                    sh_render = sh_pred
+                sh_for_render = sh_render.to(dtype=torch.float32).contiguous().unsqueeze(1)  # [M,1,3]
+                # 注意：默认不要对 render_gs 使用 no_grad（否则 photo/ssim 等监督无法回传到高斯参数）
+                # 如需紧急排查 OOM，可在 config.training.render_no_grad=true 临时启用（会关闭渲染梯度）。
+                render_no_grad = bool(config.get("training", {}).get("render_no_grad", False))
+                for vi in range(camera_poses_t.shape[0]):
+                    c2w = camera_poses_t[vi].detach().cpu().numpy()
+                    w2c = np.linalg.inv(c2w)
+                    R = w2c[:3, :3].astype(np.float32)
+                    t_vec = w2c[:3, 3].astype(np.float32)
+                    K_np = camera_intrinsics_t[vi].detach().cpu().numpy().astype(np.float32)
+                    cam = IntrinsicsCamera(
+                        K=K_np, R=R, T=t_vec,
+                        width=int(W_t), height=int(H_t),
+                        znear=0.01, zfar=100.0,
+                    )
+                    opacity = alpha_frame.squeeze(-1) if alpha_frame.dim() > 1 else alpha_frame
+                    opacity = opacity.to(dtype=mu_frame.dtype).clamp(0.0, 1.0)
+                    num_gs = mu_frame.shape[0]
+                    if rot_frame is None:
+                        rotation = torch.zeros(num_gs, 4, device=mu_frame.device, dtype=mu_frame.dtype)
+                        rotation[:, 0] = 1.0
+                    else:
+                        rotation = matrix_to_quaternion(rot_frame).to(device=mu_frame.device, dtype=mu_frame.dtype)
+                        rotation = rotation / rotation.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                    gs_attrs = GaussianAttributes(
+                        xyz=mu_frame,
+                        opacity=opacity,
+                        scaling=scale_frame,
+                        rotation=rotation,
+                        sh=sh_for_render,
+                    )
+                    with (torch.no_grad() if render_no_grad else nullcontext()):
+                        res_v = render_gs(camera=cam, bg_color=bg_color, gs=gs_attrs, target_image=None, sh_degree=0, scaling_modifier=1.0)
+                    color = res_v["color"]
+                    del res_v
+                    yield vi, color  # [3,H,W]
+                return
 
         # 流式渲染 + 直接累加 photo/ssim（不保存全量 rendered_images）
         # 注意：masked dyn/static/cross 仍保持关闭（stage2_weights 默认 0）；如需启用需单独做流式实现。
         # 可视化：保存一个小子集（用于 epoch_images），不是用于指标统计
         viz_cfg = config.get("training", {}).get("viz", {}) or {}
+        viz_every = int(viz_cfg.get("every", 10))
+        viz_only_one = bool(viz_cfg.get("only_one", True))
+        do_viz = (batch_idx == 0) and (viz_every > 0) and ((epoch % viz_every) == 0)
         viz_T = int(viz_cfg.get("times", 4))
         viz_V = int(viz_cfg.get("views", 4))
+        if not do_viz:
+            viz_T, viz_V = 0, 0
+        elif viz_only_one:
+            viz_T, viz_V = 1, 1
         viz_pred = [[None for _ in range(viz_V)] for _ in range(viz_T)]
         viz_gt = [[None for _ in range(viz_V)] for _ in range(viz_T)]
+
+        # ---- 新增：保存完整 T*V 视角的全部预测 / GT ----
+        n_views_total = camera_poses_seq.shape[1]
+        full_pred = [[None for _ in range(n_views_total)] for _ in range(T)]
+        full_gt = [[None for _ in range(n_views_total)] for _ in range(T)] if gt_images is not None else None
 
         last_rendered_images = None
         for t in range(T):
@@ -963,6 +986,10 @@ def train_epoch(
             ):
                 if gt_images is not None:
                     gt_chw = gt_images[t, vi].to(device=device, dtype=pred_chw.dtype)
+                    # 保存完整 T*V（放 CPU，避免显存爆）
+                    full_pred[t][vi] = pred_chw.detach().cpu()
+                    if full_gt is not None:
+                        full_gt[t][vi] = gt_chw.detach().cpu()
                     photo_loss_acc = photo_loss_acc + torch.nn.functional.l1_loss(pred_chw, gt_chw, reduction='mean')
                     if float(config.get('loss_weights', {}).get('ssim', 0.0)) > 0:
                         ssim_loss_acc = ssim_loss_acc + (1.0 - ssim_torch(
@@ -970,11 +997,22 @@ def train_epoch(
                             gt_chw.unsqueeze(0).clamp(0, 1),
                             window_size=11,
                         ))
-                    # LPIPS 计算（批内）
-                    if lpips_fn is not None:
+                    # LPIPS 计算（内存优化版）
+                    if (
+                        lpips_fn is not None
+                        and float(config.get('loss_weights', {}).get('lpips', 0.0)) > 0
+                        and t == 0
+                        and vi == 0
+                    ):
                         pred_nchw = pred_chw.unsqueeze(0) * 2 - 1  # [1,3,H,W] 归一化到 [-1,1]
                         gt_nchw = gt_chw.unsqueeze(0) * 2 - 1      # [1,3,H,W] 归一化到 [-1,1]
-                        lpips_loss_acc = lpips_loss_acc + lpips_fn(pred_nchw, gt_nchw).mean()
+                        with torch.no_grad():  # 关键：LPIPS不需要梯度
+                            try:
+                                lp = lpips_fn(pred_nchw, gt_nchw).mean()
+                                lpips_loss_acc = lpips_loss_acc + lp
+                                lpips_count += 1
+                            except torch.cuda.OutOfMemoryError:
+                                print("OOM in LPIPS, skipping for this item.")
                     mse = torch.mean((pred_chw - gt_chw) ** 2).clamp_min(1e-8)
                     psnr_acc = psnr_acc + (10.0 * torch.log10(1.0 / mse))
                     if t < viz_T and vi < viz_V:
@@ -983,26 +1021,50 @@ def train_epoch(
                 n_render += 1
                 del pred_chw
 
-        # 将可视化子集整理为 [T,V,3,H,W]
-        if gt_images is not None and viz_T > 0 and viz_V > 0 and viz_pred[0][0] is not None:
+        # ------ 保存完整 T*V 视角的所有预测 / GT ------
+        if full_pred[0][0] is not None:
             pred_stack = []
-            gt_stack = []
-            for tt in range(viz_T):
+            gt_stack = [] if full_gt is not None else None
+            for tt in range(T):
                 row_p = []
-                row_g = []
-                for vv in range(viz_V):
-                    p = viz_pred[tt][vv]
-                    g = viz_gt[tt][vv]
+                row_g = [] if gt_stack is not None else None
+                for vv in range(n_views_total):
+                    p = full_pred[tt][vv]
                     if p is None:
                         p = torch.zeros(3, H_t, W_t)
-                    if g is None:
-                        g = torch.zeros(3, H_t, W_t)
                     row_p.append(p)
-                    row_g.append(g)
+                    if gt_stack is not None:
+                        g = full_gt[tt][vv]
+                        if g is None:
+                            g = torch.zeros(3, H_t, W_t)
+                        row_g.append(g)
                 pred_stack.append(torch.stack(row_p, dim=0))
-                gt_stack.append(torch.stack(row_g, dim=0))
+                if gt_stack is not None:
+                    gt_stack.append(torch.stack(row_g, dim=0))
             last_rendered_images = torch.stack(pred_stack, dim=0)
-            last_gt_images = torch.stack(gt_stack, dim=0)
+            if gt_stack is not None:
+                last_gt_images = torch.stack(gt_stack, dim=0)
+        else:
+            # 将可视化子集整理为 [T,V,3,H,W]  (保持早期逻辑不变)
+            if gt_images is not None and viz_T > 0 and viz_V > 0 and viz_pred[0][0] is not None:
+                pred_stack = []
+                gt_stack = []
+                for tt in range(viz_T):
+                    row_p = []
+                    row_g = []
+                    for vv in range(viz_V):
+                        p = viz_pred[tt][vv]
+                        g = viz_gt[tt][vv]
+                        if p is None:
+                            p = torch.zeros(3, H_t, W_t)
+                        if g is None:
+                            g = torch.zeros(3, H_t, W_t)
+                        row_p.append(p)
+                        row_g.append(g)
+                    pred_stack.append(torch.stack(row_p, dim=0))
+                    gt_stack.append(torch.stack(row_g, dim=0))
+                last_rendered_images = torch.stack(pred_stack, dim=0)
+                last_gt_images = torch.stack(gt_stack, dim=0)
 
 
         # Loss weights
@@ -1033,75 +1095,37 @@ def train_epoch(
         w_imp_entropy = float(lw.get("imp_entropy", 0.0))
         w_imp_repel = float(lw.get("imp_repel", 0.0))
 
-        # Hard stage gating (clear and explicit)
-        # 重写三个阶段的损失权重（不依赖 YAML），一目了然
+        # Hard stage gating (clear and explicit)  # Two-stage
         if stage == 1:
-            # ========== Stage 1: 静态重建 ==========
+            # ========== Stage 1: 静态重建 + 弱运动 ==========
             w_photo = 1.0
-            w_ssim = 0.5
-            w_lpips = 0.2
+            w_ssim = 0.4
+            w_lpips = 0.15
             w_sil = 0.5
             w_alpha = 1e-4
-            
-            # 不使用的损失
-            w_chamfer = 0.0
-            w_kp2d = 0.0
-            w_motion = 0.0
+            w_kp2d = 0.15
+            w_motion = 0.05
             w_temp_vel = 0.0
             w_temp_acc = 0.0
             lambda_smooth = 0.0
             w_res_mag = 0.0
             w_res_smooth = 0.0
-            
-            # importance / mask 相关（保持关闭）
-            w_imp_budget = 0.0
-            w_imp_entropy = 0.0
-            w_imp_repel = 0.0
-            w_dyn = w_sta = w_cross = 0.0
-        elif stage == 2:
-            # ========== Stage 2: 学习运动 ==========
+            w_chamfer = 0.0
+        else:  # Stage 2
+            # ========== Stage 2: 强运动 + 精细化 ==========
             w_photo = 0.5
             w_ssim = 0.25
-            w_lpips = 0.0  # Stage 2 不使用 LPIPS
+            w_lpips = 0.0
             w_sil = 0.0
             w_alpha = 0.0
-            
-            # 运动相关损失
             w_kp2d = 0.5
             w_motion = 1.0
             w_temp_vel = 0.1
             w_temp_acc = 0.1
-            lambda_smooth = 0.0  # 不使用 temporal_smooth（已有 vel/acc）
-            
-            # 不使用的损失
-            w_chamfer = 0.0
-            w_res_mag = 0.0
-            w_res_smooth = 0.0
-            w_imp_budget = w_imp_entropy = w_imp_repel = 0.0
-            w_dyn = w_sta = w_cross = 0.0
-        else:  # stage 3
-            # ========== Stage 3: 精细化运动 ==========
-            w_photo = 0.5
-            w_ssim = 0.25
-            w_lpips = 0.0  # Stage 3 不使用 LPIPS
-            w_sil = 0.0
-            w_alpha = 0.0
-            
-            # 运动相关损失
-            w_kp2d = 0.3
-            w_motion = 1.0
-            w_temp_vel = 0.0  # Stage 3 不使用 temporal vel/acc
-            w_temp_acc = 0.0
             lambda_smooth = 0.0
-            
-            # residual 正则
             w_res_mag = 0.02
             w_res_smooth = 0.01
-            
-            # 不使用的损失
             w_chamfer = 0.0
-            w_imp_budget = w_imp_entropy = w_imp_repel = 0.0
-            w_dyn = w_sta = w_cross = 0.0
 
 
         if gt_images is not None and n_render > 0:
@@ -1120,8 +1144,8 @@ def train_epoch(
             ssim_loss = torch.tensor(0.0, device=device)
 
         # LPIPS loss
-        if lpips_fn is not None and gt_images is not None and n_render > 0:
-            lpips_loss = lpips_loss_acc / float(n_render)
+        if lpips_fn is not None and gt_images is not None and lpips_count > 0:
+            lpips_loss = lpips_loss_acc / float(lpips_count)
         else:
             lpips_loss = torch.tensor(0.0, device=device)
 
@@ -1221,46 +1245,52 @@ def train_epoch(
 
         chamfer_loss = torch.tensor(0.0, device=device)
 
-        if w_chamfer > 0 and points_3d is not None and points_3d.numel() > 0:
+        # 训练阶段防御式硬禁（避免误配/动态调度导致 torch.cdist OOM）
+        if stage in (1, 2):
+            w_chamfer = 0.0
+
+        if w_chamfer > 0 and points is not None and points.numel() > 0:
             K_ds = config.get('loss_params', {}).get('chamfer', {}).get('max_pairs', 2048)
             eps = 1e-8
 
             mu_0 = mu_t[0].detach()        # [M,3]  canonical (stop grad)
-            pts_0 = points_3d[0].detach() # [N,3]
+            pts_0 = points[0].reshape(points.shape[1], -1, 3).mean(dim=0).detach()  # [N,3]
 
-            loss_acc = torch.tensor(0.0, device=device)
-            valid_t = 0
+            # 更激进：Chamfer 仅作分析统计，不回传梯度（训练几何已由 photo/ssim/kp2d 拉动）
+            with torch.no_grad():
+                loss_acc = torch.tensor(0.0, device=device)
+                valid_t = 0
 
-            for t in range(1, T):
-                mu = mu_t[t]              # [M,3]
-                pts = points_3d[t]        # [N,3]
+                for t in range(1, T):
+                    mu = mu_t[t]              # [M,3]
+                    pts = points[t].reshape(points.shape[1], -1, 3).mean(dim=0)        # [N,3]
 
-                if mu.numel() == 0 or pts.numel() == 0:
-                    continue
+                    if mu.numel() == 0 or pts.numel() == 0:
+                        continue
 
-                # displacement
-                d_mu  = mu  - mu_0        # [M,3]
-                d_pts = pts - pts_0       # [N,3]
+                    # displacement
+                    d_mu  = mu  - mu_0        # [M,3]
+                    d_pts = pts - pts_0       # [N,3]
 
-                # subsample
-                m_idx = torch.randperm(d_mu.shape[0], device=device)[:min(d_mu.shape[0], K_ds)]
-                n_idx = torch.randperm(d_pts.shape[0], device=device)[:min(d_pts.shape[0], K_ds)]
+                    # subsample
+                    m_idx = torch.randperm(d_mu.shape[0], device=device)[:min(d_mu.shape[0], K_ds)]
+                    n_idx = torch.randperm(d_pts.shape[0], device=device)[:min(d_pts.shape[0], K_ds)]
 
-                d_mu_s  = d_mu[m_idx]
-                d_pts_s = d_pts[n_idx]
+                    d_mu_s  = d_mu[m_idx]
+                    d_pts_s = d_pts[n_idx]
 
-                # chamfer
-                dists = torch.cdist(d_mu_s, d_pts_s, p=2)
-                chamfer_t = (
-                    dists.min(dim=1).values.mean() +
-                    dists.min(dim=0).values.mean()
-                )
+                    # chamfer
+                    dists = torch.cdist(d_mu_s, d_pts_s, p=2)
+                    chamfer_t = (
+                        dists.min(dim=1).values.mean() +
+                        dists.min(dim=0).values.mean()
+                    )
 
-                loss_acc = loss_acc + chamfer_t
-                valid_t += 1
+                    loss_acc = loss_acc + chamfer_t
+                    valid_t += 1
 
-            if valid_t > 0:
-                chamfer_loss = loss_acc / valid_t
+                if valid_t > 0:
+                    chamfer_loss = loss_acc / valid_t
 
 
         # ------------- Keypoint 2D reprojection loss -------------
@@ -1272,6 +1302,50 @@ def train_epoch(
             T_kp, V_kp, Kk = keypoints_2d.shape[0], keypoints_2d.shape[1], keypoints_2d.shape[2]
             # soft association temperature
             tau = 4.0
+            knn = int(config.get('loss_params', {}).get('kp2d', {}).get('knn', 64))
+            knn_chunk = int(config.get('loss_params', {}).get('kp2d', {}).get('knn_chunk', 4096))
+
+            def _softmin_pred_uv_topk(
+                kp_xy: torch.Tensor,  # [K,2]
+                proj_xy: torch.Tensor,  # [Mv,2]
+                tau_val: float,
+                knn_val: int,
+                chunk: int,
+            ) -> torch.Tensor:
+                # 避免一次性构造 [K,Mv] 的 cdist（显存杀手）；改为分块扫描 + 维护 TopK。
+                K_local = int(kp_xy.shape[0])
+                M_local = int(proj_xy.shape[0])
+                if M_local == 0:
+                    return torch.zeros(K_local, 2, device=kp_xy.device, dtype=kp_xy.dtype)
+                knn_eff = min(int(knn_val), M_local)
+
+                best_d2 = torch.full((K_local, knn_eff), float("inf"), device=kp_xy.device, dtype=kp_xy.dtype)
+                best_xy = torch.zeros((K_local, knn_eff, 2), device=kp_xy.device, dtype=kp_xy.dtype)
+
+                for start in range(0, M_local, max(1, int(chunk))):
+                    end = min(M_local, start + max(1, int(chunk)))
+                    proj_c = proj_xy[start:end]  # [C,2]
+                    C_local = int(proj_c.shape[0])
+                    if C_local == 0:
+                        continue
+                    d2_sq = (kp_xy[:, None, :] - proj_c[None, :, :]).pow(2).sum(dim=-1)  # [K,C]
+
+                    # 当前 chunk 的 topk（按距离）
+                    k_chunk = min(knn_eff, C_local)
+                    d2_sq_k, idx_k = torch.topk(d2_sq, k=k_chunk, dim=1, largest=False)
+                    proj_k = proj_c[idx_k]  # [K,knn,2]
+
+                    # 与历史 topk 合并再取 topk
+                    cand_d2 = torch.cat([best_d2, d2_sq_k], dim=1)  # [K,knn + k_chunk]
+                    cand_xy = torch.cat([best_xy, proj_k], dim=1)   # [K,knn + k_chunk,2]
+                    new_d2, new_idx = torch.topk(cand_d2, k=knn_eff, dim=1, largest=False)
+                    best_xy = cand_xy.gather(1, new_idx.unsqueeze(-1).expand(-1, -1, 2))
+                    best_d2 = new_d2
+
+                d = best_d2.clamp_min(1e-12).sqrt()  # 与原 torch.cdist(p=2) 对齐
+                w = torch.softmax(-d / float(tau_val), dim=1)  # [K,knn]
+                return (w.unsqueeze(-1) * best_xy).sum(dim=1)  # [K,2]
+
             kp_err_acc = 0.0
             cnt = 0
             for t in range(min(T, T_kp)):
@@ -1300,10 +1374,9 @@ def train_epoch(
                     if vis_mask.sum() == 0:
                         continue
                     proj_vis = proj[vis_mask]                # [Mv,2]
-                    # 取每个 kp 与所有 proj_vis 的距离 softmin → 估计误差
-                    d2 = torch.cdist(kp_pix.to(device=proj_vis.device,dtype=proj_vis.dtype), proj_vis, p=2)  # [K,Mv]
-                    w = torch.softmax(-d2 / tau, dim=1)       # soft assoc
-                    pred_uv = (w.unsqueeze(-1) * proj_vis.unsqueeze(0)).sum(dim=1)  # [K,2]
+                    # softmin → TopK 近邻（显存从 O(K*Mv) 降到 O(K*knn)）
+                    kp_xy = kp_pix.to(device=proj_vis.device, dtype=proj_vis.dtype)
+                    pred_uv = _softmin_pred_uv_topk(kp_xy, proj_vis, tau, knn, knn_chunk)  # [K,2]
                     err = (pred_uv - kp_pix.to(dtype=pred_uv.dtype,device=pred_uv.device)).abs().mean()
                     kp_err_acc = kp_err_acc + err
                     cnt += 1
@@ -1328,19 +1401,30 @@ def train_epoch(
 
         imp_logits = output.get("imp_logits", None)
         if imp_logits is not None and (w_imp_budget > 0.0 or w_imp_entropy > 0.0):
-            imp_probs_raw = torch.sigmoid(imp_logits)
-            # avoid exact 0/1 which lead to log(0)=nan
-            eps_p = 1e-6
+            # OOM 防御：对超大 imp_logits 做随机采样估计（保留梯度，但显著降低峰值显存）
+            sel_cfg = config.get("loss_params", {}).get("selector", {}) or {}
+            sample_n = int(sel_cfg.get("sample", 262144))  # 0 表示不采样（全量，风险较高）
+
+            flat_logits = imp_logits.reshape(-1)
+            n_all = int(flat_logits.numel())
+            if sample_n > 0 and n_all > sample_n:
+                idx = torch.randint(0, n_all, (sample_n,), device=flat_logits.device)
+                logits_use = flat_logits[idx]
+            else:
+                logits_use = flat_logits
+
+            imp_probs_raw = torch.sigmoid(logits_use)
+            eps_p = 1e-6  # avoid exact 0/1 which lead to log(0)=nan
             imp_probs = imp_probs_raw.clamp(min=eps_p, max=1.0 - eps_p)
-            # replace any NaN / Inf that may come from nan logits
             imp_probs = torch.nan_to_num(imp_probs, nan=0.5, posinf=1.0 - eps_p, neginf=eps_p)
+
             # 让 probs 的均值接近预算比例，避免 logits 全饱和（硬选 k 固定，主要是 stabilizer）
-            target = float(mu_t.shape[1]) / float(max(1, imp_probs.numel()))
+            target = float(mu_t.shape[1]) / float(max(1, n_all))
             imp_budget_loss = (imp_probs.mean() - target) ** 2
+
             # 最大化熵：loss = -H(p)
             ent = -(imp_probs * torch.log(imp_probs) + (1.0 - imp_probs) * torch.log(1.0 - imp_probs))
             imp_entropy = torch.nan_to_num(ent, nan=0.0).mean()  # ensure finite
-            # Regularization term: maximize entropy by minimizing its negative (or set target)
             imp_entropy_reg = -imp_entropy
 
         xyz_f0 = output.get("xyz_f0", None)
@@ -1451,6 +1535,7 @@ def train_epoch(
             writer.add_scalar('Loss/AlphaSparse', sum_alpha / denom, global_step)
             writer.add_scalar('Loss/Chamfer', sum_chamfer / denom, global_step)
             writer.add_scalar('Loss/MotionReg', sum_motion / denom, global_step)
+            writer.add_scalar('Loss/KP2D', sum_kp2d / denom, global_step)
             writer.add_scalar('Loss/TemporalSmooth', sum_temporal / denom, global_step)
             writer.add_scalar("Loss/ImpBudget", sum_imp_budget / denom, global_step)
 
@@ -1468,10 +1553,10 @@ def train_epoch(
         del mu_t, scale_t, color_t, alpha_t, output
         if gt_images is not None:
             del gt_images
-        torch.cuda.empty_cache()
+        # 不要在训练 loop 中调用 empty_cache（会破坏 allocator cache，导致碎片化/更早 OOM）
 
-    # Save grid image and PLYs for last batch
-    if output_dir is not None and last_rendered_images is not None:
+    # Save grid image / PLYs for last batch (rank0 only)
+    if output_dir is not None and is_rank0:
         images_dir = os.path.join(output_dir, 'epoch_images')
         gaussians_dir = os.path.join(output_dir, 'epoch_gaussians')
         os.makedirs(images_dir, exist_ok=True)
@@ -1623,7 +1708,7 @@ def validate(
                 config=config, mode='val'
             )
             points = batch_data.get('points', None)
-            points_3d = batch_data['points_3d']
+            points_3d = batch_data.get('points_3d', None)
             feat_2d = batch_data['feat_2d']
             conf_seq = batch_data['conf']
             dyn_mask_tv = batch_data.get('dynamic_conf_tv', None)
@@ -1636,11 +1721,12 @@ def validate(
             if gt_images is not None:
                 gt_images = gt_images.permute(0, 1, 4, 2, 3).contiguous()  # [T,V,3,H,W]
             silhouette = batch_data.get('silhouette', None)
-            T = points_3d.shape[0]
+            T = int(time_ids.shape[0])
             H_t, W_t = config['data']['image_size']
             photo_loss_acc = torch.tensor(0.0, device=device)
             ssim_loss_acc = torch.tensor(0.0, device=device)
             lpips_loss_acc = torch.tensor(0.0, device=device)
+            lpips_count = 0
             n_render = 0
 
             dyn_mask_in = dyn_mask_tv if dyn_mask_tv is not None else silhouette
@@ -1730,6 +1816,7 @@ def validate(
                         scaling_modifier=1.0,
                     )
                     pred_chw = res_v["color"]  # [3,H,W]
+                    del res_v
                     if gt_images is not None:
                         gt_chw = gt_images[t, vi].to(device=device, dtype=pred_chw.dtype)
                         photo_loss_acc = photo_loss_acc + F.l1_loss(pred_chw.clamp(0, 1), gt_chw.clamp(0, 1), reduction='mean')
@@ -1738,12 +1825,18 @@ def validate(
                                 pred_chw.unsqueeze(0).clamp(0, 1),
                                 gt_chw.unsqueeze(0).clamp(0, 1),
                                 window_size=11,
-                            ))
+                        ))
                         # LPIPS 计算（验证时仅统计）
-                        if lpips_fn is not None:
+                        if (
+                            lpips_fn is not None
+                            and float(config.get('loss_weights', {}).get('lpips', 0.0)) > 0
+                            and t == 0
+                            and vi == 0
+                        ):
                             pred_nchw = pred_chw.unsqueeze(0) * 2 - 1  # [1,3,H,W] 归一化到 [-1,1]
                             gt_nchw = gt_chw.unsqueeze(0) * 2 - 1      # [1,3,H,W] 归一化到 [-1,1]
                             lpips_loss_acc = lpips_loss_acc + lpips_fn(pred_nchw, gt_nchw).mean()
+                            lpips_count += 1
                     n_render += 1
                     del pred_chw
 
@@ -1767,8 +1860,8 @@ def validate(
                 ssim_loss = torch.tensor(0.0, device=device)
 
             # LPIPS loss (validation)
-            if lpips_fn is not None and gt_images is not None and n_render > 0:
-                lpips_loss = lpips_loss_acc / float(n_render)
+            if lpips_fn is not None and gt_images is not None and lpips_count > 0:
+                lpips_loss = lpips_loss_acc / float(lpips_count)
             else:
                 lpips_loss = torch.tensor(0.0, device=device)
 
@@ -1792,11 +1885,11 @@ def validate(
 
             # Chamfer
             chamfer_loss = torch.tensor(0.0, device=device)
-            if w_chamfer > 0 and sim3_s is not None and points_3d is not None and points_3d.numel() > 0:
+            if w_chamfer > 0 and sim3_s is not None and points is not None and points.numel() > 0:
                 max_m = 4096
                 for t in range(T):
                     mu = mu_t[t]
-                    pts = points_3d[t]
+                    pts = points[t].reshape(points.shape[1], -1, 3).mean(dim=0)  # [N,3]
                     if pts.numel() == 0:
                         continue
                     s_t = sim3_s[t]
@@ -2130,6 +2223,7 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
             photo_loss_fn, lpips_fn, device, config, writer, ep,
             ex4dgs_dir=config.get('data', {}).get('ex4dgs_dir', None),
             output_dir=output_dir,
+            is_rank0=is_rank0,
         )
 
         # Only rank0 runs validation + saves checkpoints

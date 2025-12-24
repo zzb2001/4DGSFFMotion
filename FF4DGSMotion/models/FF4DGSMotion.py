@@ -144,7 +144,9 @@ def _thin_by_voxel_keep_max(
     # tie-break with tiny noise
     score2 = score + eps_tie * torch.rand_like(score)
 
-    max_per_vox = torch.full((num_vox,), -1e30, device=device, dtype=score2.dtype)
+    # score2 可能是 fp16/bf16（AMP 下），-1e30 会在 half 转换时溢出
+    fill_min = torch.finfo(score2.dtype).min
+    max_per_vox = torch.full((num_vox,), fill_min, device=device, dtype=score2.dtype)
     max_per_vox.scatter_reduce_(0, inv, score2, reduce="amax", include_self=True)
 
     keep_mask = score2 >= (max_per_vox[inv] - 1e-12)
@@ -968,7 +970,7 @@ class Trellis4DGS4DCanonical(nn.Module):
         min_vs = float(getattr(self.cfg, "imp_min_voxel_size", 1e-4))
         M_target = float(getattr(self.cfg, "imp_target_points", 100000))
         voxel_size = max(min_vs, voxel_ratio * (scene_diag / (max(1.0, M_target) ** 0.5)))
-        voxel_size=0.015
+        voxel_size=0.02
         thin_idx = _thin_by_voxel_keep_max(flat_xyz_all, p, voxel_size=voxel_size)  # [N_thin]
         xyz_0 = flat_xyz_all[thin_idx]  # [N_thin,3]
         M = int(xyz_0.shape[0])

@@ -67,7 +67,7 @@ training:
   ddp_port: 29500
   seed: 0
   # 第 1 个 epoch 使用 target_image 做每个 Gaussian 的 DC 颜色初始化（参考 test_render.py / render_gs 的 est_color）
-  color_init_first_epoch: true
+  color_init_first_epoch: false
   # 颜色初始化不作为监督 loss，而是用于渲染时的退火混合（帮助快速逼近合理颜色）
   color_init_blend_start: 1.0    # 初始完全使用 init_sh0
   color_init_blend_end: 0.0      # 最终完全使用网络输出
@@ -93,10 +93,10 @@ training:
   color_init_r_min: 0.5
   color_init_r_max: 3.0
 
-  # 三阶段训练调度（按 epoch）
+  # 两阶段训练调度（按 epoch）
   stages:
-    stage1_epochs: 50
-    stage2_epochs: 100
+    stage1_epochs: 100     # 前 100 epoch 归为 Stage-1
+    stage2_epochs: 300     # 其余 epoch 归为 Stage-2
   # Stage3 residual loss（仅当 model.use_residual_motion=true 且输出 dxyz_t_res 时生效）
   stage3_residual_mag: 0.5
   stage3_residual_smooth: 0.1

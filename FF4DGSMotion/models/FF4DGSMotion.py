@@ -74,11 +74,16 @@ def _soft_assign_topk(
 
 
 def save_ply_xyz(xyz: torch.Tensor, filename: str):
-    """Save a set of 3-D points to a PLY file using Open3D.
+    """
+    Save 3-D points to PLY file(s) using Open3D.
 
     Args:
-        xyz: Tensor [N,3] in world units.
-        filename: Output path (will create directory if needed).
+        xyz:
+            - [M, 3]      : save a single ply
+            - [T, M, 3]   : save T ply files into a subfolder
+        filename:
+            - if xyz is [M,3]   -> output ply path
+            - if xyz is [T,M,3] -> output directory path
     """
     import os
     try:
@@ -88,18 +93,56 @@ def save_ply_xyz(xyz: torch.Tensor, filename: str):
 
     if not torch.is_tensor(xyz):
         raise TypeError(f"xyz must be a torch.Tensor, got {type(xyz)}")
-    if xyz.dim() != 2 or xyz.shape[1] != 3:
-        raise ValueError(f"xyz must be [N,3], got {tuple(xyz.shape)}")
 
-    xyz_np = xyz.detach().cpu().to(torch.float32).numpy()
+    # --------------------------------------------------
+    # Case 1: [M, 3] -> single ply
+    # --------------------------------------------------
+    if xyz.dim() == 2:
+        if xyz.shape[1] != 3:
+            raise ValueError(f"xyz must be [M,3], got {tuple(xyz.shape)}")
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz_np)
+        xyz_np = xyz.detach().cpu().to(torch.float32).numpy()
 
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    if not filename.lower().endswith('.ply'):
-        filename = filename + '.ply'
-    o3d.io.write_point_cloud(filename, pcd)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz_np)
+
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        if not filename.lower().endswith(".ply"):
+            filename = filename + ".ply"
+
+        o3d.io.write_point_cloud(filename, pcd)
+        return
+
+    # --------------------------------------------------
+    # Case 2: [T, M, 3] -> T ply files in a folder
+    # --------------------------------------------------
+    if xyz.dim() == 3:
+        if xyz.shape[2] != 3:
+            raise ValueError(f"xyz must be [T,M,3], got {tuple(xyz.shape)}")
+
+        T = xyz.shape[0]
+
+        # filename is treated as directory
+        out_dir = filename
+        os.makedirs(out_dir, exist_ok=True)
+
+        xyz_np = xyz.detach().cpu().to(torch.float32).numpy()
+
+        for t in range(T):
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz_np[t])
+
+            ply_path = os.path.join(out_dir, f"frame_{t:04d}.ply")
+            o3d.io.write_point_cloud(ply_path, pcd)
+
+        return
+
+    # --------------------------------------------------
+    # Unsupported shape
+    # --------------------------------------------------
+    raise ValueError(
+        f"xyz must be [M,3] or [T,M,3], got shape {tuple(xyz.shape)}"
+    )
 
 
 def _thin_by_voxel_keep_max(
@@ -1089,7 +1132,7 @@ class Trellis4DGS4DCanonical(nn.Module):
         else:
             dxyz_res = None
 
-        mu_t = xyz_0.unsqueeze(0) + dxyz_f  # [T,M,3]
+        mu_t = xyz_0.unsqueeze(0) + dxyz_f  # [T,M,3] save_ply_xyz(xyz_0, "debug/plys/xyz_0.ply")
 
 
         # Step 4/5: 聚合外观特征 → 解码 Gaussian 属性（不改几何）
@@ -1109,7 +1152,7 @@ class Trellis4DGS4DCanonical(nn.Module):
         rot_t = gauss["rot"].unsqueeze(0).expand(T, -1, -1, -1)
 
         return {
-            "mu_t": mu_t,
+            "mu_t": mu_t,   #save_ply_xyz(mu_t, "debug/plys/mu_t")
             "scale_t": scale_t,
             "rot_t": rot_t,
             "color_t": color_t,

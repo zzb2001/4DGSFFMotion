@@ -246,12 +246,15 @@ def prepare_batch(
     camera_poses = batch['camera_poses'].to(device, non_blocking=True)  # [B,V,4,4]
     camera_intrinsics_batch = batch.get('camera_intrinsics', None)
     feat_2d_batch = batch.get('feat_2d', None)
+    flow_fwd = batch.get('flow_fwd', None)
     if feat_2d_batch is not None:
         feat_2d_batch = feat_2d_batch.to(device, non_blocking=True)  # [B,V,H',W',C]
         # 2D 特征在 AMP 训练下用 fp16 存储即可（显存减半）；验证默认保持 fp32，避免 dtype/bias 不匹配
         feat_fp16 = bool(config.get("training", {}).get("feat_2d_fp16", True))
         if mode == "train" and feat_fp16:
             feat_2d_batch = feat_2d_batch.to(dtype=torch.float16)
+    if flow_fwd is not None:
+        flow_fwd = flow_fwd.to(device, non_blocking=True).to(dtype=torch.float32)
 
     if conf.dim() == 4:
         conf = conf.unsqueeze(-1)
@@ -271,6 +274,8 @@ def prepare_batch(
         conf = conf[:T]
         time_idx = time_idx[:T]
         camera_poses = camera_poses[:T]
+        if flow_fwd is not None and flow_fwd.dim() >= 4:
+            flow_fwd = flow_fwd[:T]
     else:
         T = B
 
@@ -412,10 +417,9 @@ def prepare_batch(
             break
     if keypoints_2d is not None:
         if isinstance(keypoints_2d, torch.Tensor):
-            # keypoints_2d 仅在 loss 用到，没必要常驻 GPU：保留在 CPU，使用时再搬运
-            keypoints_2d = keypoints_2d.detach().cpu().float()
+            keypoints_2d = keypoints_2d.to(device=device, non_blocking=True).float()
         else:
-            keypoints_2d = torch.as_tensor(keypoints_2d).float()
+            keypoints_2d = torch.as_tensor(keypoints_2d, device=device).float()
         keypoints_2d = keypoints_2d[:T]
 
     # GT images if available
@@ -454,6 +458,7 @@ def prepare_batch(
         'dynamic_conf_tv': dynamic_conf_tv,  # [T,V,H,W] per-view dyn prob (optional)
         'dynamic_traj_tv': dynamic_traj_tv,  # [T,V,2,H,W] per-view traj (optional)
         'keypoints_2d': keypoints_2d,  # [T,V,K,2] optional
+        'flow_fwd': flow_fwd,          # [T,V,H,W,2] optional
     }
 
 
@@ -478,6 +483,7 @@ def train_epoch(
     sum_ssim = 0.0
     sum_psnr = 0.0
     sum_lpips = 0.0
+    sum_retarget = 0.0
 
     sum_sil = 0.0
     sum_alpha = 0.0
@@ -487,6 +493,7 @@ def train_epoch(
     sum_imp_budget = 0.0
     sum_imp_geom = 0.0
     sum_exist_budget = 0.0
+    sum_flow_sparse = 0.0
     sum_flow_reproj = 0.0
     sum_mask_dyn = 0.0
     sum_mask_sta = 0.0
@@ -507,6 +514,27 @@ def train_epoch(
     last_time_indices = None
 
     lambda_smooth = float(config.get('loss_weights', {}).get('dynamic_temporal', 0.0))
+    # Retargeting loss (Forge4D-style)
+    lw_cfg = config.get("loss_weights", {}) or {}
+    base_retarget = float(lw_cfg.get("retarget", 0.0))
+    base_retarget_ssim = float(lw_cfg.get("retarget_ssim", 1.0))
+    base_retarget_lpips = float(lw_cfg.get("retarget_lpips", 0.0))
+    base_flow_sparse = float(lw_cfg.get("flow_sparse", 0.0))
+    base_flow_reproj = float(lw_cfg.get("flow_reproj", 0.0))
+    ret_cfg = (config.get("loss_params", {}) or {}).get("retarget", {}) or {}
+    ret_detach_ref = bool(ret_cfg.get("detach_ref", True))
+    ret_view_sub = int(ret_cfg.get("view_subsample", 0))
+    # stage gating for retargeting:
+    # - default: only Stage 2 enables retargeting (motion-focused stage)
+    # - set loss_params.retarget.enable_stage1=true to also enable in Stage 1
+    enable_retarget_stage1 = bool(ret_cfg.get("enable_stage1", False))
+    flow_sparse_cfg = (config.get("loss_params", {}) or {}).get("flow_sparse", {}) or {}
+    flow_sparse_tau = float(flow_sparse_cfg.get("tau_assoc", 4.0))
+    flow_sparse_max_mu = int(flow_sparse_cfg.get("max_mu_samples", 4096))
+    flow_sparse_use_cyclic = bool(flow_sparse_cfg.get("use_cyclic_mask", False))
+    flow_reproj_cfg = (config.get("loss_params", {}) or {}).get("flow_reproj", {}) or {}
+    flow_reproj_max_mu = int(flow_reproj_cfg.get("max_mu_samples", 4096))
+    flow_reproj_use_cyclic = bool(flow_reproj_cfg.get("use_cyclic_mask", False))
 
     # ----------------------------
     # Two-stage training schedule
@@ -522,6 +550,17 @@ def train_epoch(
 
     current_stage = stage
     freeze_canonical = True if stage == 1 else False
+
+    # Effective retarget weights (must be decided before the streaming render loop)
+    if stage == 1 and not enable_retarget_stage1:
+        w_retarget = 0.0
+    else:
+        w_retarget = base_retarget
+    w_retarget_ssim = base_retarget_ssim
+    w_retarget_lpips = base_retarget_lpips
+    # Effective sparse flow weight (default: only Stage 2)
+    w_flow_sparse = 0.0 if stage == 1 else base_flow_sparse
+    w_flow_reproj = 0.0 if stage == 1 else base_flow_reproj
 
     # Adjust optimizer LR for importance head at Stage 3 (0.1x)
     def _set_imp_lr(scale: float):
@@ -545,6 +584,20 @@ def train_epoch(
             return
         for p in module.parameters():
             p.requires_grad = enabled
+
+    def project_world_to_pixel(mu_world: torch.Tensor, c2w: torch.Tensor, K: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # mu_world: [M,3], c2w: [4,4], K: [3,3]
+        if mu_world.numel() == 0:
+            return torch.zeros(0, 2, device=mu_world.device, dtype=mu_world.dtype), torch.zeros(0, device=mu_world.device, dtype=mu_world.dtype)
+        w2c = torch.inverse(c2w)
+        xyz_h = torch.cat([mu_world, torch.ones(mu_world.shape[0], 1, device=mu_world.device, dtype=mu_world.dtype)], dim=1)  # [M,4]
+        Xc = (w2c @ xyz_h.t()).t()[:, :3]
+        z = Xc[:, 2].clamp(min=1e-6)
+        uvw = (K @ Xc.t()).t()
+        u = uvw[:, 0] / uvw[:, 2].clamp(min=1e-6)
+        v = uvw[:, 1] / uvw[:, 2].clamp(min=1e-6)
+        uv = torch.stack([u, v], dim=-1)
+        return uv, z
 
     # Stage 1：训练 Gaussians & importance，冻结 motion / residual
     if stage == 1:
@@ -604,6 +657,7 @@ def train_epoch(
         dyn_mask_tv = batch_data.get('dynamic_conf_tv', None)
         dyn_traj_tv = batch_data.get('dynamic_traj_tv', None)
         keypoints_2d = batch_data.get('keypoints_2d', None) #[6, 4, 176, 2]
+        flow_fwd = batch_data.get('flow_fwd', None)
         silhouette = batch_data.get('silhouette', None)
         camera_poses_seq = batch_data['camera_poses']
         camera_intrinsics_seq = batch_data['camera_intrinsics']
@@ -652,6 +706,8 @@ def train_epoch(
         psnr_acc = torch.tensor(0.0, device=device)
         lpips_loss_acc = torch.tensor(0.0, device=device)
         lpips_count = 0
+        retarget_loss_acc = torch.tensor(0.0, device=device)
+        retarget_count = 0
         n_render = 0
 
         # 颜色初始化：第 1 个 epoch（epoch==0）使用 target_image 估计每个 Gaussian 的 DC 颜色（参考 test_render.py）
@@ -863,7 +919,7 @@ def train_epoch(
             else:
                 return sh0_use.to(device=mu_frame.device, dtype=mu_frame.dtype), est_weight_avg.to(device=mu_frame.device, dtype=mu_frame.dtype)
 
-        def render_set(mu_frame, scale_frame, rot_frame, color_frame, alpha_frame, camera_poses_t, camera_intrinsics_t, target_images_t=None):
+        def render_set(mu_frame, scale_frame, rot_frame, color_frame, alpha_frame, camera_poses_t, camera_intrinsics_t, target_images_t=None, view_ids: Optional[list[int]] = None):
             # 统一策略：模型 forward 用 AMP，但渲染端强制 fp32（避免 autocast 在 render 内反复 promote/cast 造成显存波动）
             with torch.cuda.amp.autocast(enabled=False):
                 bg_color = torch.ones(3, device=device, dtype=torch.float32)
@@ -918,7 +974,9 @@ def train_epoch(
                 # 注意：默认不要对 render_gs 使用 no_grad（否则 photo/ssim 等监督无法回传到高斯参数）
                 # 如需紧急排查 OOM，可在 config.training.render_no_grad=true 临时启用（会关闭渲染梯度）。
                 render_no_grad = bool(config.get("training", {}).get("render_no_grad", False))
-                for vi in range(camera_poses_t.shape[0]):
+                if view_ids is None:
+                    view_ids = list(range(camera_poses_t.shape[0]))
+                for vi in view_ids:
                     c2w = camera_poses_t[vi].detach().cpu().numpy()
                     w2c = np.linalg.inv(c2w)
                     R = w2c[:3, :3].astype(np.float32)
@@ -948,8 +1006,9 @@ def train_epoch(
                     with (torch.no_grad() if render_no_grad else nullcontext()):
                         res_v = render_gs(camera=cam, bg_color=bg_color, gs=gs_attrs, target_image=None, sh_degree=0, scaling_modifier=1.0)
                     color = res_v["color"]
+                    alpha = res_v.get("alpha", None)
                     del res_v
-                    yield vi, color  # [3,H,W]
+                    yield vi, color, alpha  # color:[3,H,W], alpha:[1,H,W] or [H,W]
                 return
 
         # 流式渲染 + 直接累加 photo/ssim（不保存全量 rendered_images）
@@ -974,16 +1033,33 @@ def train_epoch(
         full_gt = [[None for _ in range(n_views_total)] for _ in range(T)] if gt_images is not None else None
 
         last_rendered_images = None
+        # 如果需要计算 silhouette loss，需要保存渲染出的 alpha （一次性，float32，设备同预测）
+        # Silhouette:收集渲染出的 alpha（保持梯度，不预分配大张量避免显存峰值）
+        need_alpha = float(config.get('loss_weights', {}).get('silhouette', 0.0)) > 0
+        full_alpha = [[None for _ in range(n_views_total)] for _ in range(T)] if need_alpha else None
         for t in range(T):
             camera_poses_t = camera_poses_seq[t]
             camera_intrinsics_t = camera_intrinsics_seq[t]
             rot_frame = rot_t[t] if rot_t is not None else None
             tgt_tv = gt_images[t] if (gt_images is not None and do_color_init) else None
-            for vi, pred_chw in render_set(
+            # view subsample for retargeting (to control compute/memory)
+            V = int(camera_poses_t.shape[0])
+            if ret_view_sub > 0 and V > ret_view_sub:
+                view_ids_retarget = torch.randperm(V, device=device)[:ret_view_sub].tolist()
+            else:
+                view_ids_retarget = list(range(V))
+            for vi, pred_chw, alpha_hw in render_set(
                 mu_t[t], scale_t[t], rot_frame, color_t[t], alpha_t[t],
                 camera_poses_t, camera_intrinsics_t,
                 target_images_t=tgt_tv,
             ):
+                # 收集 alpha 用于 silhouette loss（保持在 GPU 上以便反传）
+                if need_alpha and (alpha_hw is not None):
+                    a = alpha_hw
+                    if a.dim() == 3 and a.shape[0] == 1:
+                        a = a.squeeze(0)
+                    full_alpha[t][vi] = a.float()
+
                 if gt_images is not None:
                     gt_chw = gt_images[t, vi].to(device=device, dtype=pred_chw.dtype)
                     # 保存完整 T*V（放 CPU，避免显存爆）
@@ -1020,6 +1096,66 @@ def train_epoch(
                         viz_gt[t][vi] = gt_chw.detach().cpu()
                 n_render += 1
                 del pred_chw
+
+            # Retargeting loss: warp t Gaussians to t-1 and match rendered images (L2 + SSIM + LPIPS)
+            if w_retarget > 0 and t >= 1 and len(view_ids_retarget) > 0:
+                # Reference: render frame t-1 (detach to avoid bidirectional coupling)
+                mu_ref = mu_t[t - 1].detach() if ret_detach_ref else mu_t[t - 1]
+                scale_ref = scale_t[t - 1]
+                color_ref = color_t[t - 1]
+                alpha_ref = alpha_t[t - 1]
+                rot_ref = rot_t[t - 1] if rot_t is not None else None
+                camera_poses_ref = camera_poses_seq[t - 1]
+                camera_intrinsics_ref = camera_intrinsics_seq[t - 1]
+
+                # Warp only positions; retain other attributes from t (Forge4D: retaining other attributes)
+                # We want gradients to update frame-t motion but not couple frame-(t-1), so we detach the reference.
+                # Use a stop-grad trick so the rendered position equals mu_{t-1} numerically up to a gradient-only path.
+                mu_t_warp = mu_t[t] + (mu_ref - mu_t[t].detach())
+                scale_warp = scale_t[t]
+                color_warp = color_t[t]
+                alpha_warp = alpha_t[t]
+                rot_warp = rot_frame
+
+                for vi in view_ids_retarget:
+                    ref_it = render_set(
+                        mu_ref, scale_ref, rot_ref, color_ref, alpha_ref,
+                        camera_poses_ref, camera_intrinsics_ref,
+                        target_images_t=None,
+                        view_ids=[vi],
+                    )
+                    warp_it = render_set(
+                        mu_t_warp, scale_warp, rot_warp, color_warp, alpha_warp,
+                        camera_poses_ref, camera_intrinsics_ref,
+                        target_images_t=None,
+                        view_ids=[vi],
+                    )
+                    try:
+                        _, ref_chw, _ = next(ref_it)
+                        _, warp_chw, _ = next(warp_it)
+                    except StopIteration:
+                        continue
+
+                    # L2
+                    l2 = torch.mean((warp_chw - ref_chw) ** 2)
+                    ret = l2
+                    # SSIM (our impl returns SSIM; we use (1-SSIM) loss)
+                    if w_retarget_ssim > 0:
+                        ret = ret + w_retarget_ssim * (1.0 - ssim_torch(
+                            warp_chw.unsqueeze(0).clamp(0, 1),
+                            ref_chw.unsqueeze(0).clamp(0, 1),
+                            window_size=11,
+                        ))
+                    # LPIPS (optional; recommended off first)
+                    if lpips_fn is not None and w_retarget_lpips > 0:
+                        warp_nchw = warp_chw.unsqueeze(0) * 2 - 1
+                        ref_nchw = ref_chw.unsqueeze(0) * 2 - 1
+                        with torch.no_grad():
+                            ret = ret + w_retarget_lpips * lpips_fn(warp_nchw, ref_nchw).mean()
+
+                    retarget_loss_acc = retarget_loss_acc + ret
+                    retarget_count += 1
+                    del ref_chw, warp_chw
 
         # ------ 保存完整 T*V 视角的所有预测 / GT ------
         if full_pred[0][0] is not None:
@@ -1097,25 +1233,37 @@ def train_epoch(
 
         # Hard stage gating (clear and explicit)  # Two-stage
         if stage == 1:
-            # ========== Stage 1: 静态重建 + 弱运动 ==========
-            w_photo = 1.0
-            w_ssim = 0.4
-            w_lpips = 0.15
-            w_sil = 0.5
-            w_alpha = 1e-4
+            # ========== Stage 1: 静态重建（主要监督阶段） ==========
+            # 所有核心外观监督全部放在第一阶段
+            w_photo = 1.0        # 主 L1
+            w_ssim = 0.5         # 结构一致性
+            w_lpips = 0.25       # 感知一致性
             w_kp2d = 0.15
-            w_motion = 0.05
-            w_temp_vel = 0.0
-            w_temp_acc = 0.0
-            lambda_smooth = 0.0
+            w_flow_reproj = 0.1 #使用致密光流计算的损失
+            w_sil = 0.0 #前景覆盖概率损失
+
+            w_flow_sparse = 0.0 #用 kp_{t-1} - kp_t 作为 GT flow，再约束 proj(mu_{t-1}) - proj(mu_t)，没必要
+            # Retargeting: 它的最优解是：mu_t ≈ mu_{t-1}，如果你在 stage1/early stage2 给了较大 w_retarget，它会 系统性压制 dxyz_f 的幅值
+            w_retarget = 0.0 
+            w_retarget_ssim = 0
+            w_retarget_lpips = 0
+            w_alpha = 0 #鼓励大多数 Gaussian 的 alpha → 0，不可取
+            w_motion = 0.0 #监督一阶运动和二阶运动几乎别动
             w_res_mag = 0.0
             w_res_smooth = 0.0
-            w_chamfer = 0.0
+            w_chamfer = 0.0 #修改成前景高斯（注意当前是通过位移实现的）以及points_full的chamfer距离损失，实现这一块还有点问题
         else:  # Stage 2
             # ========== Stage 2: 强运动 + 精细化 ==========
-            w_photo = 0.5
-            w_ssim = 0.25
+            # 外观监督降权，聚焦运动/几何
+            w_photo = 0.2
+            w_ssim = 0.1
             w_lpips = 0.0
+            # Retargeting: default on in Stage 2 (motion-focused stage)
+            w_retarget = base_retarget
+            w_retarget_ssim = base_retarget_ssim
+            w_retarget_lpips = base_retarget_lpips
+            w_flow_sparse = base_flow_sparse
+            w_flow_reproj = base_flow_reproj
             w_sil = 0.0
             w_alpha = 0.0
             w_kp2d = 0.5
@@ -1149,67 +1297,79 @@ def train_epoch(
         else:
             lpips_loss = torch.tensor(0.0, device=device)
 
+        # Retargeting loss (Forge4D-style)
+        if retarget_count > 0:
+            retarget_loss = retarget_loss_acc / float(retarget_count)
+        else:
+            retarget_loss = torch.tensor(0.0, device=device)
+
         psnr_val = (psnr_acc / float(n_render)).detach() if (gt_images is not None and n_render > 0) else torch.tensor(0.0, device=device)
 
         # Silhouette Loss
-        silhouette = None #batch_data.get('silhouette', None)
-        if silhouette is not None and w_sil > 0:
-            sil = silhouette.clamp(0, 1)
+        silhouette = batch_data.get('silhouette', None)
+        sil_loss = torch.zeros((), device=device, dtype=torch.float32)
 
-            # Prepare rendered alpha to be 4D [T,V,H,W]
+        if silhouette is not None and w_sil > 0:
+            # 将流式渲染收集的 alpha 组装成 [T,V,H,W]
+            if full_alpha is None or full_alpha[0][0] is None:
+                raise ValueError("Silhouette loss enabled but rendered alpha was not collected. Ensure render_set returns alpha and full_alpha is filled.")
+            rendered_alpha = torch.stack([
+                torch.stack([
+                    (full_alpha[tt][vv] if full_alpha[tt][vv] is not None else torch.zeros(H_t, W_t, device=device, dtype=torch.float32))
+                    for vv in range(n_views_total)
+                ], dim=0)
+                for tt in range(T)
+            ], dim=0)
+
+            sil = silhouette
+
+            # --- normalize sil shape ---
+            # allow [T,V,H,W] or [T,V,H,W,1]
+            while sil.dim() > 4 and sil.shape[-1] == 1:
+                sil = sil.squeeze(-1)
+            if sil.dim() != 4:
+                raise ValueError(f"silhouette must be [T,V,H,W] or [T,V,H,W,1], got {tuple(sil.shape)}")
+
+            sil = sil.float().clamp(0.0, 1.0)
+
+            # --- normalize rendered alpha shape to [T,V,H,W] ---
             ra = rendered_alpha
+            if ra is None:
+                raise ValueError("rendered_alpha is required for silhouette loss but is None")
             if ra.dim() == 5 and ra.shape[-1] == 1:
                 ra = ra.squeeze(-1)
+            if ra.dim() != 4:
+                raise ValueError(f"rendered_alpha must be [T,V,H,W] or [T,V,H,W,1], got {tuple(rendered_alpha.shape)}")
 
-            # Step 1: Ensure sil is 4D [T,V,H,W] (remove trailing singleton dims if present)
-            while sil.dim() > 4:
-                sil = sil.squeeze(-1)
+            ra = ra.float().clamp(0.0, 1.0)
 
-            # Step 2: Align spatial resolution to rendered alpha (BEFORE morphology)
+            # --- align resolution BEFORE morphology ---
             if sil.shape[-2:] != ra.shape[-2:]:
                 T_, V_, Hs, Ws = sil.shape
                 Hr, Wr = ra.shape[-2:]
-                sil_b = sil.reshape(-1, 1, Hs, Ws).float()
+                sil_b = sil.reshape(-1, 1, Hs, Ws)
                 sil_b = F.interpolate(sil_b, size=(Hr, Wr), mode='nearest')
                 sil = sil_b.reshape(T_, V_, Hr, Wr)
 
-            # Step 3: Apply optional morphology (dilate/erode) on aligned resolution
+            # --- optional morphology on aligned grid ---
             morph_cfg = config.get('loss_params', {}).get('silhouette_morph', {})
             op = str(morph_cfg.get('op', 'none')).lower()
             k = int(morph_cfg.get('k', 3))
             if k % 2 == 0:
-                k = k + 1
-
+                k += 1
             if op in ['dilate', 'erode'] and k >= 1:
                 T_, V_, H_, W_ = sil.shape
                 sil_b = sil.reshape(-1, 1, H_, W_)
                 pad = k // 2
                 if op == 'dilate':
                     sil_b = F.max_pool2d(sil_b, kernel_size=k, stride=1, padding=pad)
-                else:  # erode
+                else:
                     sil_b = 1.0 - F.max_pool2d(1.0 - sil_b, kernel_size=k, stride=1, padding=pad)
-                sil = sil_b.reshape(T_, V_, H_, W_)
+                sil = sil_b.reshape(T_, V_, H_, W_).clamp(0.0, 1.0)
 
-            # Step 4: Ensure dtype matches before computing loss
-            sil = sil.to(dtype=ra.dtype, device=ra.device)
+            # --- compute loss in float32 for stability ---
+            sil_loss = (ra - sil).abs().mean()
 
-            # Final safety alignment: handle any leftover mismatch (transpose or resize)
-            if sil.shape != ra.shape:
-                # try swapped H/W
-                if sil.shape[-2] == ra.shape[-1] and sil.shape[-1] == ra.shape[-2]:
-                    sil = sil.permute(0,1,3,2)
-                # resize if still mismatched
-                if sil.shape[-2:] != ra.shape[-2:]:
-                    T_, V_, Hs, Ws = sil.shape
-                    Hr, Wr = ra.shape[-2:]
-                    sil_b = sil.reshape(-1, 1, Hs, Ws).float()
-                    sil_b = F.interpolate(sil_b, size=(Hr, Wr), mode='nearest')
-                    sil = sil_b.reshape(T_, V_, Hr, Wr)
-
-            # Step 5: Compute loss
-            sil_loss = torch.abs(ra - sil).mean()
-        else:
-            sil_loss = torch.tensor(0.0, device=device)
 
         # Alpha sparsity (per-Gaussian)
         alpha_sparse = torch.abs(alpha_t).mean() if w_alpha > 0 else torch.tensor(0.0, device=device)
@@ -1224,18 +1384,20 @@ def train_epoch(
             acc_loss = acc.mean()
             motion_reg = 0.5 * vel_loss + 0.5 * acc_loss    #一阶二阶平滑
 
-        # Stage 3: residual motion regularization (stronger than anchor motion)
-        w_res_mag = float(stage_cfg.get("stage3_residual_mag", 0.0)) if stage == 3 else 0.0
-        w_res_smooth = float(stage_cfg.get("stage3_residual_smooth", 0.0)) if stage == 3 else 0.0
-        res_mag = torch.tensor(0.0, device=device)
-        res_smooth = torch.tensor(0.0, device=device)
-        if stage == 3 and dxyz_t_res is not None:
-            # magnitude
-            if w_res_mag > 0:
-                res_mag = dxyz_t_res.pow(2).sum(dim=-1).mean()
-            # first-order temporal smoothness on residual
-            if w_res_smooth > 0 and dxyz_t_res.shape[0] >= 2:
-                res_smooth = torch.abs(dxyz_t_res[1:] - dxyz_t_res[:-1]).mean()
+        # # Stage 3: residual motion regularization (stronger than anchor motion)
+        # w_res_mag = float(stage_cfg.get("stage3_residual_mag", 0.0)) if stage == 3 else 0.0
+        # w_res_smooth = float(stage_cfg.get("stage3_residual_smooth", 0.0)) if stage == 3 else 0.0
+        # res_mag = torch.tensor(0.0, device=device)
+        # res_smooth = torch.tensor(0.0, device=device)
+        # if stage == 3 and dxyz_t_res is not None:
+        #     # magnitude
+        #     if w_res_mag > 0:
+        #         res_mag = dxyz_t_res.pow(2).sum(dim=-1).mean()
+        #     # first-order temporal smoothness on residual
+        #     if w_res_smooth > 0 and dxyz_t_res.shape[0] >= 2:
+        #         res_smooth = torch.abs(dxyz_t_res[1:] - dxyz_t_res[:-1]).mean()
+
+
 
         # Simple/Weighted Chamfer (per frame, using points_3d transformed by Sim3)
         # --------------------------------------------------------
@@ -1245,52 +1407,73 @@ def train_epoch(
 
         chamfer_loss = torch.tensor(0.0, device=device)
 
-        # 训练阶段防御式硬禁（避免误配/动态调度导致 torch.cdist OOM）
-        if stage in (1, 2):
-            w_chamfer = 0.0
+        # ========= 配置 =========
+        dyn_thresh = config.get('loss_params', {}).get('chamfer', {}).get('dyn_thresh', 0.5)
+        min_dyn_pts = config.get('loss_params', {}).get('chamfer', {}).get('min_dyn_pts', 128)
+        K_ds = config.get('loss_params', {}).get('chamfer', {}).get('max_pairs', 2048)
+        use_no_grad = config.get('loss_params', {}).get('chamfer', {}).get('no_grad', True)
 
+        # stage gating：是否启用 chamfer（由外部 w_chamfer 控制）
         if w_chamfer > 0 and points is not None and points.numel() > 0:
-            K_ds = config.get('loss_params', {}).get('chamfer', {}).get('max_pairs', 2048)
-            eps = 1e-8
 
-            mu_0 = mu_t[0].detach()        # [M,3]  canonical (stop grad)
+            mu_0 = mu_t[0].detach()        # [M,3]
             pts_0 = points[0].reshape(points.shape[1], -1, 3).mean(dim=0).detach()  # [N,3]
 
-            # 更激进：Chamfer 仅作分析统计，不回传梯度（训练几何已由 photo/ssim/kp2d 拉动）
-            with torch.no_grad():
+            ctx = torch.no_grad() if use_no_grad else nullcontext()
+            with ctx:
                 loss_acc = torch.tensor(0.0, device=device)
                 valid_t = 0
 
-                for t in range(1, T):
-                    mu = mu_t[t]              # [M,3]
-                    pts = points[t].reshape(points.shape[1], -1, 3).mean(dim=0)        # [N,3]
+                # ===== 高斯侧：动态 mask（只算一次）=====
+                dyn_mask_mu = torch.ones(mu_0.shape[0], device=device, dtype=torch.bool)
 
-                    if mu.numel() == 0 or pts.numel() == 0:
-                        continue
+                mu_0_dyn = mu_0[dyn_mask_mu]
+                if mu_0_dyn.shape[0] < min_dyn_pts:
+                    # 动态点太少，直接跳过 Chamfer
+                    chamfer_loss = torch.tensor(0.0, device=device)
+                else:
+                    for t in range(1, T):
+                        mu = mu_t[t]              # [M,3]
+                        pts = points[t].reshape(points.shape[1], -1, 3).mean(dim=0)  # [N,3]
 
-                    # displacement
-                    d_mu  = mu  - mu_0        # [M,3]
-                    d_pts = pts - pts_0       # [N,3]
+                        if mu.numel() == 0 or pts.numel() == 0:
+                            continue
 
-                    # subsample
-                    m_idx = torch.randperm(d_mu.shape[0], device=device)[:min(d_mu.shape[0], K_ds)]
-                    n_idx = torch.randperm(d_pts.shape[0], device=device)[:min(d_pts.shape[0], K_ds)]
+                        # ===== displacement =====
+                        d_mu_all  = mu  - mu_0          # [M,3]
+                        d_pts_all = pts - pts_0         # [N,3]
 
-                    d_mu_s  = d_mu[m_idx]
-                    d_pts_s = d_pts[n_idx]
+                        # ===== 仅取动态高斯 =====
+                        d_mu = d_mu_all[dyn_mask_mu]    # [Md,3]
 
-                    # chamfer
-                    dists = torch.cdist(d_mu_s, d_pts_s, p=2)
-                    chamfer_t = (
-                        dists.min(dim=1).values.mean() +
-                        dists.min(dim=0).values.mean()
-                    )
+                        # ===== points 侧：用位移幅度筛动态前景 =====
+                        pts_disp_norm = d_pts_all.norm(dim=1)
+                        dyn_mask_pts = pts_disp_norm > pts_disp_norm.mean()  # 自适应阈值
+                        d_pts = d_pts_all[dyn_mask_pts]  # [Nd,3]
 
-                    loss_acc = loss_acc + chamfer_t
-                    valid_t += 1
+                        if d_mu.shape[0] < min_dyn_pts or d_pts.shape[0] < min_dyn_pts:
+                            continue
+
+                        # ===== subsample（防 OOM）=====
+                        m_idx = torch.randperm(d_mu.shape[0], device=device)[:min(d_mu.shape[0], K_ds)]
+                        n_idx = torch.randperm(d_pts.shape[0], device=device)[:min(d_pts.shape[0], K_ds)]
+
+                        d_mu_s  = d_mu[m_idx]
+                        d_pts_s = d_pts[n_idx]
+
+                        # ===== displacement Chamfer =====
+                        dists = torch.cdist(d_mu_s, d_pts_s, p=2)
+                        chamfer_t = (
+                            dists.min(dim=1).values.mean() +
+                            dists.min(dim=0).values.mean()
+                        )
+
+                        loss_acc = loss_acc + chamfer_t
+                        valid_t += 1
 
                 if valid_t > 0:
                     chamfer_loss = loss_acc / valid_t
+
 
 
         # ------------- Keypoint 2D reprojection loss -------------
@@ -1382,93 +1565,173 @@ def train_epoch(
                     cnt += 1
             if cnt > 0:
                 kp2d_loss = kp_err_acc / float(cnt)
-        # ---------------- Temporal regularizers -----------------
-        vel_loss = torch.tensor(0.0, device=device)
-        acc_loss = torch.tensor(0.0, device=device)
-        if dxyz_t is not None and T >= 2:
-            vel_loss = (dxyz_t[1:] - dxyz_t[:-1]).pow(2).mean()
-        if dxyz_t is not None and T >= 3:
-            acc_loss = (dxyz_t[2:] - 2 * dxyz_t[1:-1] + dxyz_t[:-2]).pow(2).mean()
-        term_temp_vel = w_temp_vel * vel_loss
-        term_temp_acc = w_temp_acc * acc_loss
-        temporal_smooth = term_temp_vel + term_temp_acc  # for logging only
 
-        # ----- Stage C regularization (budget/entropy + repulsion) -----
-        # Initialize entropy placeholders for clarity even if selector disabled
-        imp_entropy = torch.tensor(0.0, device=device)
-        imp_entropy_reg = torch.tensor(0.0, device=device)
-        imp_budget_loss = torch.tensor(0.0, device=device)
+        # # ------------- Sparse flow alignment (Forge4D-style, 2A) -------------
+        # flow_sparse_loss = torch.tensor(0.0, device=device)
+        # if w_flow_sparse > 0 and keypoints_2d is not None and keypoints_2d.numel() > 0 and T > 1:
+        #     if flow_sparse_use_cyclic and batch_idx == 0 and epoch == 0:
+        #         print("[flow_sparse] use_cyclic_mask is set but dense cyclic masking is not implemented for sparse flow; ignoring.")
+        #     H_img, W_img = H_t, W_t
+        #     loss_acc = 0.0
+        #     cnt_flow = 0
+        #     for t in range(1, T):
+        #         M_t = min(mu_t[t].shape[0], mu_t[t - 1].shape[0])
+        #         if M_t == 0:
+        #             continue
+        #         if flow_sparse_max_mu > 0 and M_t > flow_sparse_max_mu:
+        #             idx = torch.randperm(M_t, device=device)[:flow_sparse_max_mu]
+        #         else:
+        #             idx = torch.arange(M_t, device=device)
+        #         mu_t_s = mu_t[t][idx]
+        #         mu_tm1_s = mu_t[t - 1][idx]
+        #         for v in range(keypoints_2d.shape[1]):
+        #             kp_t = keypoints_2d[t, v]  # [K,2]
+        #             kp_tm1 = keypoints_2d[t - 1, v]
+        #             if kp_t.numel() == 0:
+        #                 continue
+        #             uv_t, z_t = project_world_to_pixel(mu_t_s, camera_poses_seq[t, v], camera_intrinsics_seq[t, v])
+        #             uv_tm1, _ = project_world_to_pixel(mu_tm1_s, camera_poses_seq[t - 1, v], camera_intrinsics_seq[t - 1, v])
+        #             # visibility mask (in-front + inside image)
+        #             vis = (z_t > 1e-6) & (uv_t[:, 0] >= 0) & (uv_t[:, 0] < W_img) & (uv_t[:, 1] >= 0) & (uv_t[:, 1] < H_img)
+        #             if vis.sum() < 4:
+        #                 continue
+        #             uv_t = uv_t[vis]
+        #             uv_tm1 = uv_tm1[vis]
+        #             d2 = (kp_t[:, None, :] - uv_t[None, :, :]).pow(2).sum(dim=-1)
+        #             w = torch.softmax(-d2 / max(1e-6, flow_sparse_tau ** 2), dim=1)
+        #             pred_uv_t = w @ uv_t
+        #             pred_uv_tm1 = w @ uv_tm1
+        #             flow_pred = pred_uv_tm1 - pred_uv_t
+        #             flow_gt = kp_tm1 - kp_t
+        #             loss_acc = loss_acc + (flow_pred - flow_gt).pow(2).sum(dim=-1).mean()
+        #             cnt_flow += 1
+        #     if cnt_flow > 0:
+        #         flow_sparse_loss = torch.tensor(loss_acc / float(cnt_flow), device=device)
 
-        imp_logits = output.get("imp_logits", None)
-        if imp_logits is not None and (w_imp_budget > 0.0 or w_imp_entropy > 0.0):
-            # OOM 防御：对超大 imp_logits 做随机采样估计（保留梯度，但显著降低峰值显存）
-            sel_cfg = config.get("loss_params", {}).get("selector", {}) or {}
-            sample_n = int(sel_cfg.get("sample", 262144))  # 0 表示不采样（全量，风险较高）
+        # ------------- Dense flow reprojection (Forge4D-style, 2B) -------------
+        flow_reproj_loss = torch.tensor(0.0, device=device)
+        if w_flow_reproj > 0 and isinstance(flow_fwd, torch.Tensor) and flow_fwd.numel() > 0 and T > 1:
+            if flow_reproj_use_cyclic and batch_idx == 0 and epoch == 0:
+                print("[flow_reproj] use_cyclic_mask is set but cyclic masking is not implemented; ignoring.")
+            H_img, W_img = H_t, W_t
+            loss_acc = 0.0
+            cnt_flow = 0
+            for t in range(T - 1):
+                if t >= flow_fwd.shape[0]:
+                    break
+                M_t = min(mu_t[t].shape[0], mu_t[t + 1].shape[0])
+                if M_t == 0:
+                    continue
+                if flow_reproj_max_mu > 0 and M_t > flow_reproj_max_mu:
+                    idx = torch.randperm(M_t, device=device)[:flow_reproj_max_mu]
+                else:
+                    idx = torch.arange(M_t, device=device)
+                mu_t_s = mu_t[t][idx]
+                mu_tp1_s = mu_t[t + 1][idx]
+                for v in range(flow_fwd.shape[1]):
+                    uv_t, z_t = project_world_to_pixel(mu_t_s, camera_poses_seq[t, v], camera_intrinsics_seq[t, v])
+                    uv_tp1, _ = project_world_to_pixel(mu_tp1_s, camera_poses_seq[t + 1, v], camera_intrinsics_seq[t + 1, v])
+                    vis = (z_t > 1e-6) & (uv_t[:, 0] >= 0) & (uv_t[:, 0] < W_img) & (uv_t[:, 1] >= 0) & (uv_t[:, 1] < H_img)
+                    if vis.sum() < 4:
+                        continue
+                    uv_t = uv_t[vis]
+                    uv_tp1 = uv_tp1[vis]
+                    flow_pred = uv_tp1 - uv_t
+                    # sample GT flow at uv_t
+                    flow_map = flow_fwd[t, v].to(device=device, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)  # [1,2,H,W]
+                    x = uv_t[:, 0]
+                    y = uv_t[:, 1]
+                    x_norm = (x / max(1.0, W_img - 1)) * 2.0 - 1.0
+                    y_norm = (y / max(1.0, H_img - 1)) * 2.0 - 1.0
+                    grid = torch.stack([x_norm, y_norm], dim=-1).view(1, -1, 1, 2)
+                    flow_gt = F.grid_sample(flow_map, grid, mode='bilinear', align_corners=True).squeeze(0).squeeze(-1).t()
+                    loss_acc = loss_acc + (flow_pred - flow_gt).pow(2).sum(dim=-1).mean()
+                    cnt_flow += 1
+            if cnt_flow > 0:
+                flow_reproj_loss = torch.tensor(loss_acc / float(cnt_flow), device=device)
 
-            flat_logits = imp_logits.reshape(-1)
-            n_all = int(flat_logits.numel())
-            if sample_n > 0 and n_all > sample_n:
-                idx = torch.randint(0, n_all, (sample_n,), device=flat_logits.device)
-                logits_use = flat_logits[idx]
-            else:
-                logits_use = flat_logits
 
-            imp_probs_raw = torch.sigmoid(logits_use)
-            eps_p = 1e-6  # avoid exact 0/1 which lead to log(0)=nan
-            imp_probs = imp_probs_raw.clamp(min=eps_p, max=1.0 - eps_p)
-            imp_probs = torch.nan_to_num(imp_probs, nan=0.5, posinf=1.0 - eps_p, neginf=eps_p)
+        # # ----- Stage C regularization (budget/entropy + repulsion) -----
+        # # Initialize entropy placeholders for clarity even if selector disabled
+        # imp_entropy = torch.tensor(0.0, device=device)
+        # imp_entropy_reg = torch.tensor(0.0, device=device)
+        # imp_budget_loss = torch.tensor(0.0, device=device)
 
-            # 让 probs 的均值接近预算比例，避免 logits 全饱和（硬选 k 固定，主要是 stabilizer）
-            target = float(mu_t.shape[1]) / float(max(1, n_all))
-            imp_budget_loss = (imp_probs.mean() - target) ** 2
+        # imp_logits = output.get("imp_logits", None)
+        # if imp_logits is not None and (w_imp_budget > 0.0 or w_imp_entropy > 0.0):
+        #     # OOM 防御：对超大 imp_logits 做随机采样估计（保留梯度，但显著降低峰值显存）
+        #     sel_cfg = config.get("loss_params", {}).get("selector", {}) or {}
+        #     sample_n = int(sel_cfg.get("sample", 262144))  # 0 表示不采样（全量，风险较高）
 
-            # 最大化熵：loss = -H(p)
-            ent = -(imp_probs * torch.log(imp_probs) + (1.0 - imp_probs) * torch.log(1.0 - imp_probs))
-            imp_entropy = torch.nan_to_num(ent, nan=0.0).mean()  # ensure finite
-            imp_entropy_reg = -imp_entropy
+        #     flat_logits = imp_logits.reshape(-1)
+        #     n_all = int(flat_logits.numel())
+        #     if sample_n > 0 and n_all > sample_n:
+        #         idx = torch.randint(0, n_all, (sample_n,), device=flat_logits.device)
+        #         logits_use = flat_logits[idx]
+        #     else:
+        #         logits_use = flat_logits
 
-        xyz_f0 = output.get("xyz_f0", None)
-        if xyz_f0 is not None and w_imp_repel > 0.0:
-            rp_cfg = config.get("loss_params", {}).get("imp_repel", {}) or {}
-            rp_num = int(rp_cfg.get("num_points", 4096))
-            rp_knn = int(rp_cfg.get("knn", 8))
-            rp_sigma = float(rp_cfg.get("sigma", 0.05))
-            rp_num = int(min(max(0, rp_num), int(xyz_f0.shape[0])))
-            rp_knn = int(min(max(1, rp_knn), max(1, rp_num - 1)))
-            if rp_num >= 2 and rp_sigma > 0:
-                idx = torch.randperm(int(xyz_f0.shape[0]), device=xyz_f0.device)[:rp_num]
-                x = xyz_f0[idx].to(dtype=torch.float32)
-                d2 = torch.cdist(x, x, p=2.0).pow(2)
-                d2 = d2 + torch.eye(rp_num, device=d2.device, dtype=d2.dtype) * 1e6
-                knn_d2 = torch.topk(d2, k=rp_knn, dim=-1, largest=False).values
-                sigma2 = float(max(1e-8, rp_sigma * rp_sigma))
-                imp_repel_loss = torch.exp(-knn_d2 / sigma2).mean().to(device=device, dtype=mu_t.dtype)
+        #     imp_probs_raw = torch.sigmoid(logits_use)
+        #     eps_p = 1e-6  # avoid exact 0/1 which lead to log(0)=nan
+        #     imp_probs = imp_probs_raw.clamp(min=eps_p, max=1.0 - eps_p)
+        #     imp_probs = torch.nan_to_num(imp_probs, nan=0.5, posinf=1.0 - eps_p, neginf=eps_p)
+
+        #     # 让 probs 的均值接近预算比例，避免 logits 全饱和（硬选 k 固定，主要是 stabilizer）
+        #     target = float(mu_t.shape[1]) / float(max(1, n_all))
+        #     imp_budget_loss = (imp_probs.mean() - target) ** 2
+
+        #     # 最大化熵：loss = -H(p)
+        #     ent = -(imp_probs * torch.log(imp_probs) + (1.0 - imp_probs) * torch.log(1.0 - imp_probs))
+        #     imp_entropy = torch.nan_to_num(ent, nan=0.0).mean()  # ensure finite
+        #     imp_entropy_reg = -imp_entropy
+
+        # xyz_f0 = output.get("xyz_f0", None)
+        # if xyz_f0 is not None and w_imp_repel > 0.0:
+        #     rp_cfg = config.get("loss_params", {}).get("imp_repel", {}) or {}
+        #     rp_num = int(rp_cfg.get("num_points", 4096))
+        #     rp_knn = int(rp_cfg.get("knn", 8))
+        #     rp_sigma = float(rp_cfg.get("sigma", 0.05))
+        #     rp_num = int(min(max(0, rp_num), int(xyz_f0.shape[0])))
+        #     rp_knn = int(min(max(1, rp_knn), max(1, rp_num - 1)))
+        #     if rp_num >= 2 and rp_sigma > 0:
+        #         idx = torch.randperm(int(xyz_f0.shape[0]), device=xyz_f0.device)[:rp_num]
+        #         x = xyz_f0[idx].to(dtype=torch.float32)
+        #         d2 = torch.cdist(x, x, p=2.0).pow(2)
+        #         d2 = d2 + torch.eye(rp_num, device=d2.device, dtype=d2.dtype) * 1e6
+        #         knn_d2 = torch.topk(d2, k=rp_knn, dim=-1, largest=False).values
+        #         sigma2 = float(max(1e-8, rp_sigma * rp_sigma))
+        #         imp_repel_loss = torch.exp(-knn_d2 / sigma2).mean().to(device=device, dtype=mu_t.dtype)
 
         # ===== quick diagnostics (only first batch per epoch) =====
         if batch_idx == 0:
             print(_fmt_nonzero(f'[Diag Stage{stage}]', {
-                'photo': w_photo, 'ssim': w_ssim, 'lpips': w_lpips, 'sil': w_sil, 'alpha': w_alpha,
-                'kp2d': w_kp2d, 'motion': w_motion, 'vel': w_temp_vel, 'acc': w_temp_acc,
-                'chamf': w_chamfer, 'resMag': w_res_mag, 'resSm': w_res_smooth}))
+                # Stage1 active weights
+                'photo': w_photo, 'ssim': w_ssim, 'lpips': w_lpips, 'kp2d': w_kp2d, 'flow_dp': w_flow_reproj,
+                'sil': w_sil,
+                # keep for later (commented in tensorboard section)
+                # 'alpha': w_alpha, 'motion': w_motion, 'vel': w_temp_vel, 'acc': w_temp_acc,
+                # 'chamf': w_chamfer, 'resMag': w_res_mag, 'resSm': w_res_smooth,
+            }))
         # ===== compose final loss with explicit term variables =====
         term_photo = w_photo * photo_loss
         term_ssim  = w_ssim * ssim_loss
         term_lp = w_lpips * lpips_loss
+        term_retarget = w_retarget * retarget_loss
+        # term_flow_sparse = w_flow_sparse * flow_sparse_loss
+        term_flow_reproj = w_flow_reproj * flow_reproj_loss
         term_alpha = w_alpha * alpha_sparse
         term_sil   = w_sil * sil_loss
         term_cham  = w_chamfer * chamfer_loss
         term_motion = w_motion * motion_reg
-        term_imp_budget = w_imp_budget * imp_budget_loss
-        term_imp_entropy = w_imp_entropy * imp_entropy_reg
-        term_res_mag = w_res_mag * res_mag
-        term_res_smooth = w_res_smooth * res_smooth
+        # term_imp_budget = w_imp_budget * imp_budget_loss
+        # term_imp_entropy = w_imp_entropy * imp_entropy_reg
         term_kp2d = w_kp2d * kp2d_loss
-        term_temp = lambda_smooth * temporal_smooth
+        # term_temp = lambda_smooth * temporal_smooth
         loss = (
-            term_photo + term_ssim + term_lp + term_sil + term_alpha +
-            term_cham + term_motion + term_temp + term_kp2d +
-            term_imp_budget + term_imp_entropy + term_res_mag + term_res_smooth +
+            term_photo + term_ssim + term_lp + term_retarget + term_flow_reproj + term_sil + term_alpha +
+            term_cham + term_motion + term_kp2d +
             w_dyn * mask_dyn_loss + w_sta * mask_sta_loss + w_cross * mask_cross_loss
+            # term_imp_budget + term_imp_entropy  + term_flow_sparse + term_temp +
         )
 
         # 累积 eval_loss（photo+ssim+chamfer，用于日志对齐）
@@ -1477,9 +1740,9 @@ def train_epoch(
 
         if batch_idx == 0 and epoch % 1 == 0:
             print(_fmt_nonzero(f'[TermContrib Stage{stage}]', {
-                        'photo': term_photo, 'ssim': term_ssim, 'lpips': term_lp, 'sil': term_sil,
-                        'kp2d': term_kp2d, 'motion': term_motion, 'vel': term_temp_vel, 'acc': term_temp_acc,
-                        'chamfer': term_cham, 'resMag': term_res_mag, 'resSm': term_res_smooth}))
+                        'photo': term_photo, 'ssim': term_ssim, 'lpips': term_lp, 'retarget': term_retarget,  'flow_dp': term_flow_reproj, 'sil': term_sil,
+                        'kp2d': term_kp2d, 'motion': term_motion,'chamfer': term_cham,}))
+                        #'flow_sp': term_flow_sparse,  'vel': term_temp_vel, 'acc': term_temp_acc,'resMag': term_res_mag, 'resSm': term_res_smooth}
         #【TODO】将rendered_images 和 gt_images [4, 4, 3, 378, 504]绘制在一张大图上，大图两行每行 16 张图
         # rendered_images_concat = torch.cat([rendered_images, gt_images], dim=0).view(32, 3, 378, 504)
         # save_image(rendered_images_concat, 'debug/images/rendered_gt_images.png')
@@ -1493,21 +1756,24 @@ def train_epoch(
         sum_photo += float(photo_loss.item())
         sum_ssim += float(ssim_loss.item())
         sum_lpips += float(lpips_loss.item())
+        sum_retarget += float(retarget_loss.item())
+        # sum_flow_sparse += float(flow_sparse_loss.item())
+        sum_flow_reproj += float(flow_reproj_loss.item())
         sum_psnr += float(psnr_val.item())
         sum_sil += float(sil_loss.item())
         sum_alpha += float(alpha_sparse.item())
         sum_chamfer += float(chamfer_loss.item())
         sum_motion += float(motion_reg.item())
-        sum_temporal += float(temporal_smooth.item())
-        sum_imp_budget += float(imp_budget_loss.item())
+        # sum_temporal += float(temporal_smooth.item())
+        # sum_imp_budget += float(imp_budget_loss.item())
         # optional losses
         sum_mask_dyn += float(mask_dyn_loss.item())
         sum_mask_sta += float(mask_sta_loss.item())
         sum_mask_cross += float(mask_cross_loss.item())
-        sum_res_mag += float(res_mag.item())
-        sum_res_smooth += float(res_smooth.item())
-        sum_imp_entropy += float(imp_entropy.item() if 'imp_entropy' in locals() else 0.0)
-        sum_imp_repel += float(imp_repel_loss.item() if 'imp_repel_loss' in locals() else 0.0)
+            # sum_res_mag += float(res_mag.item())
+            # sum_res_smooth += float(res_smooth.item())
+            # sum_imp_entropy += float(imp_entropy.item() if 'imp_entropy' in locals() else 0.0)
+            # sum_imp_repel += float(imp_repel_loss.item() if 'imp_repel_loss' in locals() else 0.0)
         sum_kp2d += float(kp2d_loss.item())
 
         n_batches += 1
@@ -1530,14 +1796,34 @@ def train_epoch(
             writer.add_scalar('Loss/Photo', sum_photo / denom, global_step)
             writer.add_scalar('Loss/SSIM', sum_ssim / denom, global_step)
             writer.add_scalar('Loss/LPIPS', sum_lpips / denom, global_step)
-            writer.add_scalar('Metric/PSNR', sum_psnr / denom, global_step)
+            # ==== Only log active Stage-1 losses ====
+            writer.add_scalar('Loss/FlowDense', sum_flow_reproj / denom, global_step)
             writer.add_scalar('Loss/Silhouette', sum_sil / denom, global_step)
-            writer.add_scalar('Loss/AlphaSparse', sum_alpha / denom, global_step)
-            writer.add_scalar('Loss/Chamfer', sum_chamfer / denom, global_step)
-            writer.add_scalar('Loss/MotionReg', sum_motion / denom, global_step)
             writer.add_scalar('Loss/KP2D', sum_kp2d / denom, global_step)
-            writer.add_scalar('Loss/TemporalSmooth', sum_temporal / denom, global_step)
-            writer.add_scalar("Loss/ImpBudget", sum_imp_budget / denom, global_step)
+            writer.add_scalar('Metric/PSNR', sum_psnr / denom, global_step)
+            # writer.add_scalar('Loss/Retarget', sum_retarget / denom, global_step)  # inactive in Stage-1
+            # writer.add_scalar('Loss/FlowSparse', sum_flow_sparse / denom, global_step)  # unused
+            # writer.add_scalar('Loss/AlphaSparse', sum_alpha / denom, global_step)
+            # writer.add_scalar('Loss/Chamfer', sum_chamfer / denom, global_step)
+            # writer.add_scalar('Loss/MotionReg', sum_motion / denom, global_step)
+            # writer.add_scalar('Loss/TemporalSmooth', sum_temporal / denom, global_step)
+            # writer.add_scalar('Loss/ImpBudget', sum_imp_budget / denom, global_step)
+
+            # ==== Log loss weights for transparency ====
+            writer.add_scalar('Weight/Photo', w_photo, global_step)
+            writer.add_scalar('Weight/SSIM', w_ssim, global_step)
+            writer.add_scalar('Weight/LPIPS', w_lpips, global_step)
+            writer.add_scalar('Weight/FlowDense', w_flow_reproj, global_step)
+            writer.add_scalar('Weight/Silhouette', w_sil, global_step)
+            writer.add_scalar('Weight/KP2D', w_kp2d, global_step)
+            # Retargeting debug: verify motion is being trained
+            try:
+                if mu_t is not None and T > 1:
+                    writer.add_scalar('Diag/MuDelta_t1', (mu_t[1] - mu_t[0]).abs().mean().item(), global_step)
+                if dxyz_t is not None:
+                    writer.add_scalar('Diag/DxyzMean', dxyz_t.abs().mean().item(), global_step)
+            except Exception:
+                pass
 
             if do_color_init:
                 # 记录当前退火系数（越大越依赖 init_sh0）
@@ -1654,7 +1940,14 @@ def train_epoch(
         'loss_eval': sum_eval / denom,
         'photo_loss': sum_photo / denom,
         'ssim_loss': sum_ssim / denom,
-        'lpips_loss': sum_lpips / denom,
+        'lpips_loss': sum_lpips / denom,  # stage1 active
+        # 'retarget_loss': sum_retarget / denom,
+        # 'flow_sparse_loss': sum_flow_sparse / denom,
+        'flow_dense_loss': sum_flow_reproj / denom,
+        'silhouette_loss': sum_sil / denom,
+        'retarget_loss': sum_retarget / denom,
+        'flow_sparse_loss': sum_flow_sparse / denom,
+        'flow_reproj_loss': sum_flow_reproj / denom,
         'psnr': sum_psnr / denom,
         'silhouette_loss': sum_sil / denom,
         'alpha_sparsity': sum_alpha / denom,
@@ -1714,6 +2007,7 @@ def validate(
             dyn_mask_tv = batch_data.get('dynamic_conf_tv', None)
             dyn_traj_tv = batch_data.get('dynamic_traj_tv', None)
             keypoints_2d = batch_data.get('keypoints_2d', None)
+            flow_fwd = batch_data.get('flow_fwd', None)
             camera_poses_seq = batch_data['camera_poses']
             camera_intrinsics_seq = batch_data['camera_intrinsics']
             time_ids = batch_data['time_ids']
@@ -2080,6 +2374,7 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
         preload_all=bool(data_cfg.get("preload_all", True)),
         sample_interval=int(data_cfg.get("sample_interval", 30)),
         image_dir=data_cfg.get("image_dir", None),
+        flow_fwd_path=data_cfg.get("flow_fwd_path", None),
     )
 
     # Deterministic, non-overlapping split by contiguous indices to avoid any
@@ -2240,12 +2535,15 @@ def _train_worker(local_rank: int, world_size: int, config: dict, args, output_d
                 'photo_loss': train_metrics['photo_loss'],
                 'ssim_loss': train_metrics['ssim_loss'],
                 'lpips_loss': train_metrics['lpips_loss'],
+                'retarget_loss': train_metrics.get('retarget_loss', 0.0),
+                'flow_sparse_loss': train_metrics.get('flow_sparse_loss', 0.0),
+                'flow_reproj_loss': train_metrics.get('flow_reproj_loss', 0.0),
                 'alpha_sparsity': train_metrics['alpha_sparsity'],
                 'kp2d_loss': train_metrics.get('kp2d_loss', 0.0),
                 'motion_reg': train_metrics.get('motion_reg', 0.0),
                 'psnr': train_metrics.get('psnr', 0.0),
             }
-            print(_fmt_metrics("Train", train_display, ['photo_loss','ssim_loss','lpips_loss','alpha_sparsity','kp2d_loss','motion_reg','psnr']))
+            print(_fmt_metrics("Train", train_display, ['photo_loss','ssim_loss','lpips_loss','retarget_loss','flow_sparse_loss','flow_reproj_loss','alpha_sparsity','kp2d_loss','motion_reg','psnr']))
 
             if val_loader is not None:
                 val_metrics = validate(

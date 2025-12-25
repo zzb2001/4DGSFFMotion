@@ -113,7 +113,8 @@ loss_weights:
   dynamic_temporal: 0.0          # 2nd-order smoothness on mu_t
   motion_reg: 0.0                # regularize per-frame motion using SegAnyMo dynamic_conf (stage gating overrides)
   imp_geom: 1.0                  # Importance–Geometry alignment (stage gating overrides)
-  flow_reproj: 0.0               # Optical flow reprojection loss (enabled Stage>=2)
+  flow_reproj: 0.05              # Optical flow reprojection loss (enabled Stage>=2)
+  flow_sparse: 0.05              # Sparse flow alignment (keypoints-based)
   imp_budget: 0.1                # Importance stabilizer (Stage1 small; overridden by stage gating)
   exist_budget: 0.001            # Soft budget normalization loss weight (weak)
 
@@ -129,6 +130,13 @@ loss_params:
     use_alpha: true              # weight by Gaussian alpha
     use_visibility: true         # weight by per-point visibility aggregated from conf
     max_pairs: 2048              # per-frame subsample cap for chamfer (lower to reduce cost; Stage 3 only)
+  flow_sparse:
+    tau_assoc: 4.0               # association temperature
+    max_mu_samples: 4096         # per-frame subsample cap for mu
+    use_cyclic_mask: false
+  flow_reproj:
+    max_mu_samples: 4096         # per-frame subsample cap for mu (dense flow sampling)
+    use_cyclic_mask: false
 
 inference:
   num_frames: 6
@@ -158,6 +166,7 @@ data:
   preload_all: true
   use_sim3_normalize: false
   ex4dgs_dir: /home/star/zzb/Pi3/assets/Ex4DGS
+  flow_fwd_path: /home/star/zzb/Pi3/assets/Ex4DGS/flow/flow_fwd.pt
   # Original camera intrinsics before resize (used to rescale intrinsics for rendering)
   orig_size: [2028, 2704]   # [H0, W0]
   f_orig: 1462.73832557

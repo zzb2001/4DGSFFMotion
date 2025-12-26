@@ -53,7 +53,8 @@ def render_gs(
     bg_color = bg_color.float()
     if target_image is not None:
         target_image = target_image.to(device=xyz.device, dtype=torch.float32, non_blocking=True)
-    autocast_ctx = torch.cuda.amp.autocast(enabled=False) if xyz.is_cuda else nullcontext()
+    # torch.cuda.amp.autocast 已弃用，改用 torch.amp.autocast('cuda', enabled=...)
+    autocast_ctx = torch.amp.autocast('cuda', enabled=False) if xyz.is_cuda else nullcontext()
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(xyz, dtype=xyz.dtype, requires_grad=True, device=xyz.device) + 0

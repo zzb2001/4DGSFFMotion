@@ -51,6 +51,15 @@ model:
   # Step 7（可选）：residual motion（细节点残差）
   use_residual_motion: true
 
+  # Motion Block (跨帧交互，生成高频/细节运动)
+  use_motion_block: true
+  motion_topk_views: 2  # motion 对外观不敏感，可以用更少的 views（节省计算）
+  motion_block_heads: 4
+  motion_block_mlp_hidden: 256
+  motion_block_velocity_scale: 0.1  # velocity 输出范围限制（tanh * scale），避免训练初期速度过大
+  motion_high_freq_weight: 1.0  # β weight for dxyz_f_high (Stage 1 时自动设为 0，Stage 2 时使用此值)
+  motion_scale_init: 0.05  # motion_scale 初始值（从默认 0.3 降低到 0.05，减小训练初期运动幅度）
+
   # Aggregator 视角 top-k（性能控制）
   top_k_views: 4
   # 当 fine_num_points 很大（例如 100k）时，避免 MHA/SDPA 触发 CUDA invalid configuration
@@ -108,10 +117,12 @@ training:
 loss_weights:
   photo_l1: 1.0
   ssim: 0.5                      # SSIM term weight (on 1-SSIM)
+  lpips: 0.0                     # LPIPS perceptual loss weight (set > 0 to enable)
   alpha_l1: 1.0e-4               # sparsity on per-Gaussian alpha
   chamfer: 0.0                   # Chamfer weight base (stage gating overrides)
   dynamic_temporal: 0.0          # 2nd-order smoothness on mu_t
   motion_reg: 0.0                # regularize per-frame motion using SegAnyMo dynamic_conf (stage gating overrides)
+  velocity_high_smooth: 0.1      # velocity smoothness for motion_block (L_vel_smooth = |v_t - v_{t-1}|.mean())
   imp_geom: 1.0                  # Importance–Geometry alignment (stage gating overrides)
   flow_reproj: 0.05              # Optical flow reprojection loss (enabled Stage>=2)
   flow_sparse: 0.05              # Sparse flow alignment (keypoints-based)

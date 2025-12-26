@@ -438,6 +438,202 @@ class AnchorDeltaHead(nn.Module):
         return out
 
 
+class MotionPointAggregator(nn.Module):
+    """MotionPointAggregator: 复用 MultiViewPointAggregator 的逻辑，但输出每个时间帧的聚合特征。
+
+    输入/参数与 MultiViewPointAggregator 一致：
+      - xyz: [M,3]
+      - feat_2d: [T,V,H',W',C]
+      - camera_poses: [T,V,4,4]
+      - camera_intrinsics: [T,V,3,3]
+      - time_ids: [T]
+
+    输出：
+      - g_time: [T,M,C]
+
+    最省工作量实现：对每个 t 单独调用一次 view 聚合（top-k view），最后 stack。
+    注意：motion 对外观不敏感，建议在 cfg 中把 topk_views 设置得更小（例如 1/2）。
+    """
+
+    def __init__(
+        self,
+        feat_dim: int,
+        num_layers: int,
+        num_heads: int,
+        time_emb_dim: int,
+        view_emb_dim: int,
+        topk_views: int = 2,
+        hidden_dim: int = 256,
+        max_views: int = 64,
+        chunk_points: int = 20000,
+    ):
+        super().__init__()
+        self.feat_dim = int(feat_dim)
+        self.time_emb_dim = int(time_emb_dim)
+        self.view_emb_dim = int(view_emb_dim)
+        self.topk_views = int(topk_views)
+        self.chunk_points = int(chunk_points)
+
+        self.view_emb = nn.Embedding(int(max_views), self.view_emb_dim)
+        self.pos_proj = nn.Linear(self.time_emb_dim + self.view_emb_dim, 32)
+        self.feat_proj = nn.Linear(self.feat_dim + 32, int(hidden_dim))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=int(hidden_dim),
+            nhead=int(num_heads),
+            dim_feedforward=int(hidden_dim) * 2,
+            batch_first=True,
+            dropout=0.0,
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=int(num_layers))
+        self.out_proj = nn.Linear(int(hidden_dim), self.feat_dim)
+
+    @staticmethod
+    def _posenc_t(t_scalar: torch.Tensor, dim: int) -> torch.Tensor:
+        device = t_scalar.device
+        half = dim // 2
+        freqs = torch.exp(torch.linspace(0, 8, steps=half, device=device))
+        phases = t_scalar.view(-1, 1) * freqs.view(1, -1)
+        emb = torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
+        if dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
+    @staticmethod
+    def _project_points(Xw: torch.Tensor, c2w: torch.Tensor, K: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        Xw32 = Xw.to(torch.float32)
+        c2w32 = c2w.to(torch.float32)
+        K32 = K.to(torch.float32)
+        w2c32 = torch.inverse(c2w32)
+        M = Xw32.shape[0]
+        Xw_h = torch.cat([Xw32, torch.ones(M, 1, device=Xw32.device, dtype=torch.float32)], dim=1)
+        Xc = (w2c32 @ Xw_h.t()).t()[:, :3]
+        z = Xc[:, 2]
+        uvw = (K32 @ Xc.t()).t()
+        u = uvw[:, 0] / uvw[:, 2].clamp(min=1e-6)
+        v = uvw[:, 1] / uvw[:, 2].clamp(min=1e-6)
+        return u.to(Xw.dtype), v.to(Xw.dtype), z.to(Xw.dtype)
+
+    @staticmethod
+    def _bilinear_sample(feat: torch.Tensor, u_pix: torch.Tensor, v_pix: torch.Tensor, H_img: float, W_img: float) -> torch.Tensor:
+        Hp, Wp, C = feat.shape
+        u_feat = u_pix * (Wp / max(1.0, W_img))
+        v_feat = v_pix * (Hp / max(1.0, H_img))
+        x = 2.0 * (u_feat / max(1.0, Wp - 1)) - 1.0
+        y = 2.0 * (v_feat / max(1.0, Hp - 1)) - 1.0
+        grid = torch.stack([x, y], dim=-1).view(1, -1, 1, 2).to(dtype=feat.dtype)
+        feat_chw = feat.permute(2, 0, 1).unsqueeze(0)  # [1,C,Hp,Wp]
+        sampled = F.grid_sample(feat_chw, grid, mode="bilinear", align_corners=True)
+        return sampled.squeeze(0).squeeze(-1).permute(1, 0)  # [M,C]
+
+    def _aggregate_single_t(
+        self,
+        xyz: torch.Tensor,               # [M,3]
+        feat_2d_t: torch.Tensor,         # [V,H',W',C]
+        camera_poses_t: torch.Tensor,    # [V,4,4]
+        camera_intrinsics_t: torch.Tensor,  # [V,3,3]
+        t_emb: torch.Tensor,             # [Dt]
+    ) -> torch.Tensor:
+        device = feat_2d_t.device
+        dtype = feat_2d_t.dtype
+        V, Hp, Wp, C = feat_2d_t.shape
+        M = int(xyz.shape[0])
+        if M == 0:
+            return torch.zeros(0, self.feat_dim, device=device, dtype=dtype)
+
+        cx = camera_intrinsics_t[0, 0, 2]
+        cy = camera_intrinsics_t[0, 1, 2]
+        W_img = 2.0 * cx
+        H_img = 2.0 * cy
+
+        # view score: prefer visible and closer
+        view_scores = []
+        for v in range(V):
+            u, vv, z = self._project_points(xyz, camera_poses_t[v], camera_intrinsics_t[v])
+            in_img = (u >= 0) & (u < W_img) & (vv >= 0) & (vv < H_img)
+            visible = (z > 1e-4) & in_img
+            score = (1.0 / (z.clamp(min=0.1) + 1e-6)) * visible.to(dtype)
+            view_scores.append(score)
+        view_scores = torch.stack(view_scores, dim=0)  # [V,M]
+        scores_m = view_scores.t()  # [M,V]
+
+        Ksel = int(min(max(1, self.topk_views), V))
+        _, topk_idx = torch.topk(scores_m, k=Ksel, dim=1, largest=True)  # [M,K]
+
+        hidden = int(self.feat_proj.out_features)
+        seq = torch.zeros(M, Ksel, hidden, device=device, dtype=dtype)
+
+        for v in range(V):
+            match = (topk_idx == v).nonzero(as_tuple=False)
+            if match.numel() == 0:
+                continue
+            m_idx = match[:, 0]
+            k_idx = match[:, 1]
+            u, vv, z = self._project_points(xyz[m_idx], camera_poses_t[v], camera_intrinsics_t[v])
+            sampled = self._bilinear_sample(feat_2d_t[v], u, vv, float(H_img), float(W_img))  # [Q,C]
+            sampled = sampled * (z > 1e-4).to(dtype).unsqueeze(-1)
+
+            v_safe = min(v, self.view_emb.num_embeddings - 1)
+            v_emb = self.view_emb(torch.tensor(v_safe, device=device)).expand(m_idx.shape[0], -1)
+            t_emb_b = t_emb.expand(m_idx.shape[0], -1)
+            pos32 = self.pos_proj(torch.cat([t_emb_b, v_emb], dim=-1))
+
+            h = self.feat_proj(torch.cat([sampled, pos32], dim=-1))
+            seq[m_idx, k_idx, :] = h
+
+        seq = self.transformer(seq)  # [M,K,H]
+        g = seq.mean(dim=1)
+        return self.out_proj(g)
+
+    def forward(
+        self,
+        xyz: torch.Tensor,                 # [M,3]
+        feat_2d: torch.Tensor,             # [T,V,H',W',C]
+        camera_poses: torch.Tensor,        # [T,V,4,4]
+        camera_intrinsics: torch.Tensor,   # [T,V,3,3]
+        time_ids: torch.Tensor,            # [T]
+    ) -> torch.Tensor:
+        device = feat_2d.device
+        dtype = feat_2d.dtype
+        T, V, Hp, Wp, C = feat_2d.shape
+        M = int(xyz.shape[0])
+        if M == 0:
+            return torch.zeros(T, 0, self.feat_dim, device=device, dtype=dtype)
+
+        # chunk points to avoid invalid configuration in attention kernels
+        if self.chunk_points > 0 and M > self.chunk_points:
+            outs = []
+            for i0 in range(0, M, self.chunk_points):
+                outs.append(
+                    self.forward(
+                        xyz[i0:i0 + self.chunk_points],
+                        feat_2d,
+                        camera_poses,
+                        camera_intrinsics,
+                        time_ids,
+                    )
+                )
+            return torch.cat(outs, dim=1)
+
+        t_min = time_ids.min()
+        t_max = torch.clamp(time_ids.max(), min=t_min + 1)
+        t_norm = (time_ids.float() - t_min.float()) / (t_max.float() - t_min.float())
+        t_emb_all = self._posenc_t(t_norm, self.time_emb_dim)  # [T,Dt]
+
+        g_list = []
+        for t in range(T):
+            g_list.append(
+                self._aggregate_single_t(
+                    xyz,
+                    feat_2d[t],
+                    camera_poses[t],
+                    camera_intrinsics[t],
+                    t_emb_all[t],
+                )
+            )
+        return torch.stack(g_list, dim=0)  # [T,M,C]
+
+
 class MultiViewPointAggregator(nn.Module):
     def __init__(
         self,
@@ -597,6 +793,56 @@ class MultiViewPointAggregator(nn.Module):
         return self.out_proj(g)
 
 
+class MotionBlock(nn.Module):
+    """MotionBlock: 最小跨帧交互模块。
+
+    输入:
+      - g_tm1: [M,C]
+      - g_t:   [M,C]
+    计算:
+      Q=g_t, K/V=g_tm1 做 cross-attn 得到 m_t
+      再 MLP(m_t) -> v_t [M,3] (velocity)
+
+    输出:
+      - v_t: [M,3]
+
+    备注：这里用 nn.MultiheadAttention（batch_first=True）实现，按 M 作为 sequence length。
+    """
+
+    def __init__(self, dim: int, num_heads: int = 4, mlp_hidden: int = 256, velocity_scale: float = 0.1):
+        super().__init__()
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.norm_q = nn.LayerNorm(self.dim)
+        self.norm_kv = nn.LayerNorm(self.dim)
+        self.attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.num_heads, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(self.dim),
+            nn.Linear(self.dim, int(mlp_hidden)),
+            nn.GELU(),
+            nn.Linear(int(mlp_hidden), 3),
+        )
+        # velocity scale: 限制 velocity 的输出范围，避免训练初期速度过大
+        self.velocity_scale = float(velocity_scale)
+
+    def forward(self, g_tm1: torch.Tensor, g_t: torch.Tensor) -> torch.Tensor:
+        if g_tm1.dim() != 2 or g_t.dim() != 2:
+            raise ValueError(f"g_tm1/g_t must be [M,C], got {tuple(g_tm1.shape)}, {tuple(g_t.shape)}")
+        if g_tm1.shape != g_t.shape:
+            raise ValueError(f"g_tm1/g_t shape mismatch: {tuple(g_tm1.shape)} vs {tuple(g_t.shape)}")
+
+        # [1,M,C]
+        q = self.norm_q(g_t).unsqueeze(0)
+        kv = self.norm_kv(g_tm1).unsqueeze(0)
+        m, _ = self.attn(query=q, key=kv, value=kv, need_weights=False)
+        m = m.squeeze(0)  # [M,C]
+        v = self.mlp(m)   # [M,3]
+        # 使用 tanh 限制 velocity 范围，避免训练初期速度过大
+        # 乘以 velocity_scale 来控制初始速度幅度（默认 0.1）
+        v = torch.tanh(v) * self.velocity_scale
+        return v
+
+
 class GaussianHead(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, use_scale_refine: bool = False, use_rot_refine: bool = False, opacity_init_bias: float = -2.0):
         super().__init__()
@@ -677,6 +923,13 @@ class ModelCfg:
     use_dyn_pred_token: bool = True
     use_residual_motion: bool = False
 
+    # Motion block (跨帧交互)
+    use_motion_block: bool = True
+    motion_topk_views: int = 2  # motion 对外观不敏感，可以用更少的 views
+    motion_block_heads: int = 4
+    motion_block_mlp_hidden: int = 256
+    motion_high_freq_weight: float = 1.0  # β weight for dxyz_f_high
+
     top_k_views: int = 4
     point_agg_chunk: int = 20000
     max_scale: float = 0.05
@@ -740,6 +993,28 @@ class Trellis4DGS4DCanonical(nn.Module):
             chunk_points=int(getattr(self.cfg, "point_agg_chunk", 20000)),
         )
 
+        # Step 4.5: Motion Point Aggregator（用于 motion block）
+        if bool(getattr(self.cfg, "use_motion_block", True)):
+            self.motion_point_aggregator = MotionPointAggregator(
+                feat_dim=int(self.cfg.feat_agg_dim),
+                num_layers=int(self.cfg.feat_agg_layers),
+                num_heads=int(self.cfg.feat_agg_heads),
+                time_emb_dim=int(self.cfg.time_emb_dim),
+                view_emb_dim=int(self.cfg.view_emb_dim),
+                topk_views=int(getattr(self.cfg, "motion_topk_views", 2)),
+                hidden_dim=int(self.cfg.feat_agg_dim),
+                chunk_points=int(getattr(self.cfg, "point_agg_chunk", 20000)),
+            )
+            self.motion_block = MotionBlock(
+                dim=int(self.cfg.feat_agg_dim),
+                num_heads=int(getattr(self.cfg, "motion_block_heads", 4)),
+                mlp_hidden=int(getattr(self.cfg, "motion_block_mlp_hidden", 256)),
+                velocity_scale=float(getattr(self.cfg, "motion_block_velocity_scale", 0.1)),
+            )
+        else:
+            self.motion_point_aggregator = None
+            self.motion_block = None
+
         # Step 5: Gaussian Head（属性解码）
         self.gaussian_head = GaussianHead(
             in_dim=int(self.cfg.feat_agg_dim),
@@ -750,7 +1025,8 @@ class Trellis4DGS4DCanonical(nn.Module):
 
         # Motion scale parameter (for amplitude warmup)
         # 全局可学习 motion_scale，用于调节 dxyz_f 的幅度（支持 warm-up）
-        motion_scale_init = float(getattr(self.cfg, "motion_scale_init", 0.3))
+        # 降低初始值以减小训练初期的运动幅度（从 0.3 降到 0.05）
+        motion_scale_init = float(getattr(self.cfg, "motion_scale_init", 0.05))
         # 作为可学习参数（而非 buffer）
         self.motion_scale = nn.Parameter(torch.tensor(motion_scale_init, dtype=torch.float32))
 
@@ -1090,7 +1366,7 @@ class Trellis4DGS4DCanonical(nn.Module):
         exist_w1 = exist_w.view(-1, 1)
 
         # ============================================================
-        # Stage C2/C3: soft assignment → distribute anchor motion to selected fine points
+        # Stage C2/C3: soft assignment → distribute anchor motion to selected fine points (低频/大运动)
         # ============================================================
         if Md > 0:
             idx_d, w_d = _soft_assign_topk(
@@ -1101,31 +1377,96 @@ class Trellis4DGS4DCanonical(nn.Module):
                 chunk=4096,
             )  # [M,K]
             dxyz_sel = dxyz_anchor_d[:, idx_d]  # [T,M,K,3]
-            dxyz_f = (w_d.unsqueeze(0).unsqueeze(-1) * dxyz_sel).sum(dim=2)  # [T,M,3]
+            dxyz_f_low = (w_d.unsqueeze(0).unsqueeze(-1) * dxyz_sel).sum(dim=2)  # [T,M,3]
         else:
             idx_d = torch.zeros(M, 0, device=device, dtype=torch.long)
             w_d = torch.zeros(M, 0, device=device, dtype=dtype)
-            dxyz_f = torch.zeros(T, M, 3, device=device, dtype=dtype)
+            dxyz_f_low = torch.zeros(T, M, 3, device=device, dtype=dtype)
 
         # gate_motion 仅依赖动态概率 p_dyn_f，并设置下限防止 early zero
+        # 在 Stage 1 时降低下限，减少不必要的运动
         if dyn_flat is not None:
             p_dyn_f = dyn_flat[thin_idx].view(-1, 1).clamp(0.0, 1.0)  # [M,1]
         else:
             p_dyn_f = torch.full((M, 1), 0.5, device=device, dtype=dtype)
-        gate_motion = (0.2 + 0.8 * p_dyn_f).clamp(0.0, 1.0)  # soft gate with lower bound 0.2
+        # Stage 1 时使用更小的下限（0.05），Stage 2 时使用 0.2
+        gate_lower_bound = 0.05 if freeze_canonical else 0.2
+        gate_motion = (gate_lower_bound + (1.0 - gate_lower_bound) * p_dyn_f).clamp(0.0, 1.0)
 
         # 只在 alpha/opacity 分支使用 exist_w1
-        dxyz_f = self.motion_scale * dxyz_f * gate_motion.view(1, M, 1)
+        dxyz_f_low = self.motion_scale * dxyz_f_low * gate_motion.view(1, M, 1)
+
+        # ============================================================
+        # Motion Block: 跨帧交互生成高频/细节运动 (dxyz_f_high)
+        # ============================================================
+        # 使用 motion_point_aggregator 生成 g_time [T,M,C]（可被 residual motion 复用）
+        g_time = None
+        dxyz_f_high = None
+        velocity_high = None  # [T-1,M,3] velocity for smoothness loss
+        if self.motion_point_aggregator is not None and self.motion_block is not None:
+            # 使用 motion_point_aggregator 生成 g_time [T,M,C]
+            g_time = self.motion_point_aggregator(
+                xyz_0,
+                feat_red,
+                camera_poses,
+                camera_intrinsics,
+                time_ids,
+            )  # [T,M,C]
+
+            # 使用 MotionBlock 生成 velocity v_t [M,3]，然后积分得到位移
+            # 速度积分形式（Forge4D 核心假设）：dxyz_f_high[0]=0; dxyz_f_high[t]=dxyz_f_high[t-1]+v_t
+            dxyz_f_high = torch.zeros(T, M, 3, device=device, dtype=dtype)
+            velocity_list = []  # 保存所有 velocity 用于 smoothness loss
+            for t in range(1, T):
+                v_t = self.motion_block(g_time[t-1], g_time[t])  # [M,3] - velocity
+                velocity_list.append(v_t)
+                dxyz_f_high[t] = dxyz_f_high[t-1] + v_t  # 积分得到位移
+            
+            # Stack velocities: [T-1, M, 3]
+            if len(velocity_list) > 0:
+                velocity_high = torch.stack(velocity_list, dim=0)  # [T-1, M, 3]
+
+            # 使用 gate_motion 或配置的权重
+            # 在 Stage 1 (freeze_canonical=True) 时，禁用或大幅降低 motion_block 的贡献
+            base_beta = float(getattr(self.cfg, "motion_high_freq_weight", 1.0))
+            # 如果 freeze_canonical=True（Stage 1），将 beta 设为 0，避免早期运动过大
+            beta = 0.0 if freeze_canonical else base_beta
+            dxyz_f_high = beta * dxyz_f_high * gate_motion.view(1, M, 1)
+
+        # ============================================================
+        # 合并低频和高频运动
+        # ============================================================
+        if dxyz_f_high is not None:
+            dxyz_f = dxyz_f_low + dxyz_f_high
+        else:
+            dxyz_f = dxyz_f_low
 
         # Step 7: residual motion（可选）
+        # 这里原逻辑有问题：上面虽然计算了 g_diff/z_f，但随即又用 point_aggregator 的输出覆盖 z_f，
+        # 导致“用差分信号只补高频”的设计失效。
+        # 修复：
+        # - 仍以差分特征作为 residual head 的输入；
+        # - 为了给 residual head 注入视角/相机条件（如果需要），用 point_aggregator 做一次条件聚合，
+        #   再与差分特征融合（加法/concat 取决于 head 期望，这里用加法且对齐维度）。
         if self.residual_motion_head is not None:
-            z_f = self.point_aggregator(
+            if T >= 2:
+                g_diff = g_time[1:] - g_time[:-1]          # [T-1,M,C]
+                z_diff = g_diff.mean(dim=0)                # [M,C]
+            else:
+                z_diff = torch.zeros(M, g_time.shape[-1], device=device, dtype=dtype)
+
+            # 可选：加入条件聚合特征（外观/相机条件），避免 residual 过于“盲目”
+            z_cond = self.point_aggregator(
                 xyz_0,
-                feat_red.mean(dim=0, keepdim=True),  # 使用所有时间平均的观察，增强表达力
+                feat_red.mean(dim=0, keepdim=True),
                 camera_poses,
                 camera_intrinsics,
                 time_ids,
             )  # [M,C]
+
+            # 融合：默认加法（维度一致时最稳）
+            z_f = z_diff + z_cond
+
             dxyz_res = self.residual_motion_head(z_f, time_ids)  # [T,M,3]
             # residual 分支同样使用 gate_motion（不依赖 exist_w1）
             dxyz_f = dxyz_f + gate_motion.view(1, M, 1) * dxyz_res
@@ -1159,6 +1500,7 @@ class Trellis4DGS4DCanonical(nn.Module):
             "alpha_t": alpha_t,
             "dxyz_t": dxyz_f,
             "dxyz_t_res": dxyz_res,
+            "velocity_high": velocity_high,  # [T-1, M, 3] velocity from motion_block for smoothness loss
             "anchors_mu_static": mu_s0,
             "anchors_mu_dynamic": mu_d0,
             "dxyz_anchor_dynamic": dxyz_anchor_d,
